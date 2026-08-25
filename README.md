@@ -145,6 +145,10 @@ PYCLIPSYNC=$(nix build .#default --print-out-paths)/bin/pyclipsync \
 
 - Design and WeChat MIME-type handling inspired by
   [123hi123/clipsync](https://github.com/123hi123/clipsync) (MIT)
+- QQ MIME-type mapping follows
+  [SHORiN-KiWATA/linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync);
+  also consulted [arabianq/wl-x11-clipsync](https://github.com/arabianq/wl-x11-clipsync)
+  and [w568w/qq-wayland-clipboard](https://github.com/w568w/qq-wayland-clipboard)
 - [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
 - [wl-clipboard](https://github.com/bugaevc/wl-clipboard)
 - [xclip](https://github.com/astrand/xclip), [clipnotify](https://github.com/cdown/clipnotify)
