@@ -28,5 +28,9 @@
 
           default = self.packages.${system}.pyclipsync;
         });
+
+      homeModules = {
+        default = import ./nix/home-module.nix;
+      };
     };
 }

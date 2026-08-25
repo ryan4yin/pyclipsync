@@ -86,24 +86,12 @@ All are in nixpkgs.
 pyclipsync
 ```
 
-or as a systemd user service:
-
-```ini
-# ~/.config/systemd/user/pyclipsync.service
-[Unit]
-Description=Wayland <-> X11 clipboard sync (pyclipsync)
-After=graphical-session.target
-
-[Service]
-ExecStart=%h/.nix-profile/bin/pyclipsync
-Restart=on-failure
-RestartSec=1
-
-[Install]
-WantedBy=graphical-session.target
-```
+or as a systemd user service (see [`pyclipsync.service`](./pyclipsync.service)):
 
 ```sh
+# install the script where the unit expects it, then the unit itself
+install -Dm755 pyclipsync.py ~/.local/bin/pyclipsync
+install -Dm644 pyclipsync.service ~/.config/systemd/user/pyclipsync.service
 systemctl --user enable --now pyclipsync
 journalctl --user -u pyclipsync -f
 ```
@@ -121,9 +109,21 @@ flake.packages.${builtins.currentSystem}.default
 or as a flake input:
 
 ```nix
-inputs.pyclipsync.url = "github:ryan4yin/pyclipsync";
-# ...
+inputs.pyclipsync = {
+  url = "github:ryan4yin/pyclipsync";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+```nix
+# run it manually: just add the package
 home.packages = [ inputs.pyclipsync.packages.${system}.pyclipsync ];
+
+# or manage it as a systemd user service (home-manager module):
+home-manager.users.<user> = {
+  imports = [ inputs.pyclipsync.homeModules.default ];
+  services.pyclipsync.enable = true;
+};
 ```
 
 ## Testing
