@@ -38,17 +38,35 @@ Details worth knowing:
   per new offer — a pure change signal.
 - **`xclip` write mode forks** a background child to hold the selection; that
   child inherits stdout/stderr, so the writer points them at `/dev/null`
-  (never `capture_output`) or the call would block until timeout.
+  (never `capture_output`) or the call would block until timeout. **`wl-copy`
+  does the same thing** (a background child serves the Wayland data), so it is
+  written the same way.
+- **`wl-copy` appends one trailing newline** to piped `text/*` input.
+  `pyclipsync` strips one trailing newline before invoking it, so text always
+  lands on the Wayland side with exactly one trailing newline.
+- **A symmetric 1-second Wayland poller** backs up `wl-paste --watch`: if a
+  W -> X push fails, no new Wayland offer would ever re-trigger it, so the
+  poller guarantees convergence.
+- Bookkeeping ("last synced" per side) is only updated **after a push
+  succeeds**, so a failed push is retried on the next event/poll. The
+  destination side is recorded from a **readback** of the real clipboard, not
+  from the pushed payload, so tool quirks (like the newline above) can never
+  desync the dedup state.
 
 A per-side "last synced" digest (sha256), evaluated under a single lock together
 with the read and the push, prevents X -> W -> X feedback loops and echo
 ping-pong under rapid successive copies.
 
-Content types, highest priority wins:
+Content types, highest priority wins (mapping follows
+[linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)):
 
-- `text/uri-list` — WeChat/QQ images arrive as `text/uri-list` +
-  `application/x-qt-image`; normalized to `file://` URIs on both sides
+- `x-special/gnome-copied-files` — QQ stickers / GNOME file copy (the `copy`
+  action header is stripped); becomes `text/uri-list` on the Wayland side
+- `text/uri-list` — WeChat/QQ images; bare absolute paths are rewritten to
+  `file://` URIs on both sides
 - `image/png`
+- `image/jpeg`
+- `text/html` — QQ rich text
 - text (`UTF8_STRING` / `text/plain`)
 
 Empty clipboards are never propagated (protects the other side's content).
@@ -106,6 +124,21 @@ or as a flake input:
 inputs.pyclipsync.url = "github:ryan4yin/pyclipsync";
 # ...
 home.packages = [ inputs.pyclipsync.packages.${system}.pyclipsync ];
+```
+
+## Testing
+
+Integration tests live in [`tests/test_sync.py`](./tests/test_sync.py)
+(standard-library `unittest`, no extra dependencies). They start a real daemon
+under a **live X11 (XWayland) + Wayland session** and verify byte-exact sync
+for every supported type in both directions, including the QQ sticker
+(`gnome-copied-files`) case and a rapid double-copy race. The whole suite
+skips when `DISPLAY` / `WAYLAND_DISPLAY` / the helper tools are missing.
+
+```sh
+python3 -m unittest discover -v              # test the repo's pyclipsync.py
+PYCLIPSYNC=$(nix build .#default --print-out-paths)/bin/pyclipsync \
+    python3 -m unittest discover -v          # test the built binary
 ```
 
 ## Credits

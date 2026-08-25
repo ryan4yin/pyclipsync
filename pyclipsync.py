@@ -16,10 +16,15 @@ https://github.com/123hi123/clipsync):
 
 A per-side "last synced" state machine prevents X -> W -> X loops.
 
-Content types, highest priority wins:
-  - text/uri-list   (WeChat/QQ images arrive as uri-list + application/x-qt-image)
-  - image/png
-  - text            (UTF8_STRING / text/plain)
+Content types, highest priority wins (matching linuxqq-clipsync for the
+WeChat/QQ cases):
+  - uri   x-special/gnome-copied-files (GNOME file copy, QQ stickers) or
+          text/uri-list (WeChat images)  -> normalized to file:// URIs,
+          carried as text/uri-list on both sides
+  - png   image/png
+  - jpeg  image/jpeg
+  - html  text/html   (QQ rich text)
+  - text  UTF8_STRING / text/plain / STRING
 
 Dependencies: python3 (stdlib only), xclip, clipnotify, wl-clipboard.
 """
@@ -40,18 +45,39 @@ log = logging.getLogger("pyclipsync")
 
 # X11 atoms
 X_URI = "text/uri-list"
+X_GNOME_FILES = "x-special/gnome-copied-files"
 X_PNG = "image/png"
+X_JPEG = "image/jpeg"
+X_HTML = "text/html"
 X_UTF8 = "UTF8_STRING"
 X_STRING = "STRING"
 X_PLAIN = "text/plain"
-# targets that mark an uri-list as an image/file copy (WeChat, Qt, GNOME)
-X_URI_MARKERS = {"application/x-qt-image", "x-special/gnome-copied-files"}
 
 # Wayland mime types
 W_TEXT = "text/plain"
 W_PNG = "image/png"
+W_JPEG = "image/jpeg"
+W_HTML = "text/html"
 W_URI = "text/uri-list"
-W_WATCH_TYPES = [W_TEXT, W_PNG, W_URI]
+# one wl-paste --watch thread per offered mime type
+W_WATCH_TYPES = [W_TEXT, W_PNG, W_JPEG, W_HTML, W_URI]
+
+# kind -> target/mime per direction (uri-list always maps to text/uri-list on
+# both sides; that is what WeChat and QQ read for pasted file/image links)
+W_TARGETS = {
+    "text": W_TEXT,
+    "uri": W_URI,
+    "png": W_PNG,
+    "jpeg": W_JPEG,
+    "html": W_HTML,
+}
+X_TARGETS = {
+    "text": X_UTF8,
+    "uri": X_URI,
+    "png": X_PNG,
+    "jpeg": X_JPEG,
+    "html": X_HTML,
+}
 
 
 def run(cmd: list[str], data: bytes | None = None, timeout: float = 5.0):
@@ -79,8 +105,32 @@ def wl_read(mime: str) -> bytes | None:
 
 
 def wl_copy(mime: str, data: bytes) -> bool:
-    rc, _ = run(["wl-copy", "--type", mime], data=data)
-    return rc == 0
+    """Write the Wayland clipboard.
+
+    wl-copy (like xclip) keeps a background child alive to serve the data;
+    that child inherits stdout/stderr, so capture_output would block until
+    timeout even though the data was already delivered. Point them at
+    /dev/null so the call returns as soon as the parent exits.
+
+    wl-copy also appends exactly one trailing newline to piped text/* input.
+    To keep the Wayland clipboard clean (a single trailing newline, no empty
+    final line), strip one trailing newline first for text mimes: the net
+    effect is that text always lands on W with exactly one trailing newline.
+    """
+    if mime.startswith("text/") and data.endswith(b"\n"):
+        data = data[:-1]
+    try:
+        r = subprocess.run(
+            ["wl-copy", "--type", mime],
+            input=data,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        )
+        return r.returncode == 0
+    except (subprocess.SubprocessError, OSError) as e:
+        log.debug("wl-copy %s failed: %s", mime, e)
+        return False
 
 
 def x_targets() -> set[str]:
@@ -121,11 +171,16 @@ def x_set(target: str, data: bytes) -> bool:
 
 
 def normalize_uri(data: bytes) -> bytes:
-    """Normalize an uri-list: drop the gnome 'copy' header, ensure file:// URIs."""
+    """Normalize an uri-list / gnome-copied-files payload.
+
+    Drops the leading 'copy'/'cut' action header that
+    x-special/gnome-copied-files carries, and rewrites bare absolute paths to
+    file:// URIs. Returns b"" when nothing usable remains.
+    """
     lines = [
         line
         for line in data.decode("utf-8", "replace").splitlines()
-        if line.strip() and line.strip() != "copy"
+        if line.strip() and line.strip() not in ("copy", "cut")
     ]
     out = []
     for line in lines:
@@ -144,19 +199,39 @@ def h(data: bytes | None) -> str:
 
 
 def x_state():
-    """Read the X11 CLIPBOARD. Returns (kind, data, digest) or None."""
+    """Read the X11 CLIPBOARD. Returns (kind, data, digest) or None.
+
+    Priority (highest first), matching linuxqq-clipsync:
+      uri  x-special/gnome-copied-files  (GNOME file copy, QQ stickers)
+      uri  text/uri-list                 (WeChat images, generic file list)
+      png  image/png
+      jpeg image/jpeg
+      html text/html                     (QQ rich text)
+      text UTF8_STRING / text/plain / STRING
+    """
     targets = x_targets()
     if not targets or targets == {"TARGETS"}:
         return None
-    if X_URI in targets and targets & X_URI_MARKERS:
-        data = x_read(X_URI)
+    if X_GNOME_FILES in targets:
+        data = normalize_uri(x_read(X_GNOME_FILES) or b"")
         if data:
-            data = normalize_uri(data)
+            return ("uri", data, h(data))
+    if X_URI in targets:
+        data = normalize_uri(x_read(X_URI) or b"")
+        if data:
             return ("uri", data, h(data))
     if X_PNG in targets:
         data = x_read(X_PNG)
         if data:
             return ("png", data, h(data))
+    if X_JPEG in targets:
+        data = x_read(X_JPEG)
+        if data:
+            return ("jpeg", data, h(data))
+    if X_HTML in targets:
+        data = x_read(X_HTML)
+        if data:
+            return ("html", data, h(data))
     for target in (X_UTF8, X_PLAIN, X_STRING):
         if target in targets:
             data = x_read(target)
@@ -166,19 +241,29 @@ def x_state():
 
 
 def w_state():
-    """Read the Wayland clipboard. Returns (kind, data, digest) or None."""
+    """Read the Wayland clipboard. Returns (kind, data, digest) or None.
+
+    Priority: uri-list > png > jpeg > html > text.
+    """
     types = wl_types()
     if not types:
         return None
     if W_URI in types:
-        data = wl_read(W_URI)
+        data = normalize_uri(wl_read(W_URI) or b"")
         if data:
-            data = normalize_uri(data)
             return ("uri", data, h(data))
     if W_PNG in types:
         data = wl_read(W_PNG)
         if data:
             return ("png", data, h(data))
+    if W_JPEG in types:
+        data = wl_read(W_JPEG)
+        if data:
+            return ("jpeg", data, h(data))
+    if W_HTML in types:
+        data = wl_read(W_HTML)
+        if data:
+            return ("html", data, h(data))
     if W_TEXT in types:
         data = wl_read(W_TEXT)
         if data:
@@ -186,28 +271,30 @@ def w_state():
     return None
 
 
-def push_x_to_w(state):
+def push_x_to_w(state) -> bool:
     kind, data, _ = state
-    if kind == "text" and not wl_copy(W_TEXT, data):
-        log.warning("wl-copy text/plain failed")
-    elif kind == "png" and not wl_copy(W_PNG, data):
-        log.warning("wl-copy image/png failed")
-    elif kind == "uri" and not wl_copy(W_URI, data):
-        log.warning("wl-copy text/uri-list failed")
-    else:
-        log.info("X -> W: synced %s (%d bytes)", kind, len(data))
+    mime = W_TARGETS.get(kind)
+    if mime is None:
+        log.warning("X -> W: unknown kind %s", kind)
+        return False
+    if not wl_copy(mime, data):
+        log.warning("wl-copy %s failed", mime)
+        return False
+    log.info("X -> W: synced %s (%d bytes)", kind, len(data))
+    return True
 
 
-def push_w_to_x(state):
+def push_w_to_x(state) -> bool:
     kind, data, _ = state
-    if kind == "text" and not x_set(X_UTF8, data):
-        log.warning("xclip UTF8_STRING failed")
-    elif kind == "png" and not x_set(X_PNG, data):
-        log.warning("xclip image/png failed")
-    elif kind == "uri" and not x_set(X_URI, data):
-        log.warning("xclip text/uri-list failed")
-    else:
-        log.info("W -> X: synced %s (%d bytes)", kind, len(data))
+    target = X_TARGETS.get(kind)
+    if target is None:
+        log.warning("W -> X: unknown kind %s", kind)
+        return False
+    if not x_set(target, data):
+        log.warning("xclip %s failed", target)
+        return False
+    log.info("W -> X: synced %s (%d bytes)", kind, len(data))
+    return True
 
 
 class Syncer:
@@ -222,6 +309,12 @@ class Syncer:
         # step: reading the state outside the lock lets a thread capture a
         # stale clipboard, then pass a stale dedup check and push old data,
         # which is what causes X -> W -> X echo ping-pong under rapid copies.
+        # Bookkeeping (last_*) is only updated once the push succeeds, so a
+        # failed push is retried on the next event/poll instead of stalling.
+        # The destination side is recorded from a readback, not from the
+        # pushed payload: wl-copy does not preserve text byte-exactly (it
+        # appends a trailing newline to piped input), so the measured state
+        # is the only source of truth for future dedup decisions.
         with self.lock:
             state = x_state()
             if state is None:
@@ -229,13 +322,13 @@ class Syncer:
                 return
             if state[2] == (self.last_x or ("", b"", ""))[2]:
                 return
-            self.last_x = state
             if state[2] == (self.last_w or ("", b"", ""))[2]:
                 log.debug("X -> W: already in sync, skipping")
                 return
-            self.last_w = state
             log.info("X clipboard: %s", state[0])
-            push_x_to_w(state)
+            if push_x_to_w(state):
+                self.last_x = state
+                self.last_w = w_state() or state
 
     def on_w_change(self):
         with self.lock:
@@ -244,13 +337,13 @@ class Syncer:
                 return
             if state[2] == (self.last_w or ("", b"", ""))[2]:
                 return
-            self.last_w = state
             if state[2] == (self.last_x or ("", b"", ""))[2]:
                 log.debug("W -> X: already in sync, skipping")
                 return
-            self.last_x = state
             log.info("Wayland clipboard: %s", state[0])
-            push_w_to_x(state)
+            if push_w_to_x(state):
+                self.last_w = state
+                self.last_x = x_state() or state
 
 
 def watch_clipnotify(syncer: Syncer):
@@ -300,6 +393,23 @@ def watch_x_poll(syncer: Syncer, interval: float = 1.0):
             log.exception("x poll failed")
 
 
+def watch_w_poll(syncer: Syncer, interval: float = 1.0):
+    """W -> X safety net, symmetric to watch_x_poll.
+
+    wl-paste --watch only fires on *new* offers; if a W -> X push fails
+    (e.g. xclip transiently unavailable) there is no further W event to
+    trigger a retry, so the sync would stall until the user copies again.
+    Polling the Wayland state guarantees convergence; on_w_change is
+    digest-deduped so the extra reads are cheap no-ops when nothing changed.
+    """
+    while True:
+        time.sleep(interval)
+        try:
+            syncer.on_w_change()
+        except Exception:  # noqa: BLE001 - never let the poller die
+            log.exception("w poll failed")
+
+
 def watch_wayland(syncer: Syncer, mime: str):
     """W -> X: forward each Wayland clipboard offer of the given mime type.
 
@@ -342,6 +452,9 @@ def main():
     ).start()
     threading.Thread(
         target=watch_x_poll, args=(syncer,), daemon=True, name="x2w-poll"
+    ).start()
+    threading.Thread(
+        target=watch_w_poll, args=(syncer,), daemon=True, name="w2x-poll"
     ).start()
     for mime in W_WATCH_TYPES:
         threading.Thread(
