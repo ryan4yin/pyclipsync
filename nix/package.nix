@@ -20,11 +20,15 @@ python3Packages.buildPythonApplication {
   '';
 
   # The daemon shells out to wl-copy/wl-paste (wl-clipboard), xclip and
-  # clipnotify at runtime; per nixpkgs convention, runtime executables of
-  # dependencies are passed via makeWrapperArgs. The python interpreter is
-  # handled by buildPythonApplication itself (absolute shebang + PATH).
-  makeWrapperArgs = [
-    "--prefix PATH : ${lib.makeBinPath [ wl-clipboard xclip clipnotify ]}"
+  # clipnotify at runtime. Declaring them as propagatedBuildInputs lets the
+  # python wrap hook add their bin/ to the wrapper PATH automatically (and
+  # propagates them to consumers, e.g. a systemd service). The python
+  # interpreter itself (absolute shebang + PATH) is handled by
+  # buildPythonApplication.
+  propagatedBuildInputs = [
+    wl-clipboard
+    xclip
+    clipnotify
   ];
 
   meta = with lib; {
