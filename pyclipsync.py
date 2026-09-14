@@ -84,6 +84,12 @@ X_TARGETS = {
 W_SUPPORTED = {W_TEXT, W_PNG, W_JPEG, W_HTML, W_URI, "text/plain;charset=utf-8"}
 X_SUPPORTED = {X_UTF8, X_STRING, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
 
+# Recycle each watcher child every N seconds. A helper can wedge (stay alive but
+# stop delivering events), which would otherwise stall sync until the whole
+# service is restarted; bounding its lifetime makes it self-heal. Env-overridable
+# for tuning and tests.
+WATCH_RECYCLE_SECONDS = float(os.environ.get("WATCH_RECYCLE_SECONDS", "300"))
+
 
 def run(cmd: list[str], data: bytes | None = None, timeout: float = 5.0):
     """Run a command. Returns (returncode, stdout). Never raises."""
@@ -406,8 +412,10 @@ def watch_clipnotify(syncer: Syncer):
                 [clipnotify],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=WATCH_RECYCLE_SECONDS,
             )
         except (subprocess.SubprocessError, OSError) as e:
+            # Includes TimeoutExpired: recycle a clipnotify that stopped firing.
             log.debug("clipnotify run failed: %s", e)
             time.sleep(0.2)
             continue
@@ -449,6 +457,33 @@ def watch_w_poll(syncer: Syncer, interval: float = 1.0):
             log.exception("w poll failed")
 
 
+def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
+    """Run `cmd`, call on_event() per stdout line, then recycle the child.
+
+    Returns when the command exits on its own or after `recycle` seconds, so
+    the caller can restart it. Bounding a watcher's lifetime is what lets the
+    daemon recover from a wedged helper without detecting the wedge: a fresh
+    child is spawned on every call.
+    """
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
+        recycler = threading.Timer(recycle, p.terminate)
+        recycler.daemon = True
+        recycler.start()
+        try:
+            assert p.stdout is not None
+            for _ in p.stdout:
+                on_event()
+        finally:
+            recycler.cancel()
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=2)
+
+
 def watch_wayland(syncer: Syncer, mime: str):
     """W -> X: forward each Wayland clipboard offer of the given mime type.
 
@@ -457,16 +492,20 @@ def watch_wayland(syncer: Syncer, mime: str):
     the given type appears. We use bare `echo`, which ignores stdin and
     prints a single newline per offer -- a pure change signal. We re-read
     the full state afterwards.
+
+    The watch child is recycled every WATCH_RECYCLE_SECONDS (see _watch_once)
+    so a wedged watcher cannot silently stall W -> X sync; an offer missed in
+    the brief restart gap is caught by watch_w_poll.
     """
-    with subprocess.Popen(
-        ["wl-paste", "--type", mime, "--watch", "echo"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    ) as p:
-        assert p.stdout is not None
-        for _ in p.stdout:
-            log.debug("watch %s: new offer", mime)
-            syncer.on_w_change()
+    cmd = ["wl-paste", "--type", mime, "--watch", "echo"]
+
+    def on_event() -> None:
+        log.debug("watch %s: new offer", mime)
+        syncer.on_w_change()
+
+    while True:
+        _watch_once(cmd, on_event, WATCH_RECYCLE_SECONDS)
+        time.sleep(0.2)
 
 
 def main():

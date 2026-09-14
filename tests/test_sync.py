@@ -304,5 +304,32 @@ class UnreadableOfferLogTest(unittest.TestCase):
             )
 
 
+class WatchRecycleTest(unittest.TestCase):
+    """Unit tests for the watcher recycle helper (no live session needed)."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_recycles_a_hung_command(self):
+        events = []
+        start = time.monotonic()
+        self.pc._watch_once(
+            ["sh", "-c", "echo tick; sleep 30"], lambda: events.append(1), 0.3
+        )
+        self.assertEqual(events, [1])
+        self.assertLess(time.monotonic() - start, 5.0)
+
+    def test_returns_when_command_exits(self):
+        events = []
+        start = time.monotonic()
+        self.pc._watch_once(["sh", "-c", "echo once"], lambda: events.append(1), 30)
+        self.assertEqual(events, [1])
+        self.assertLess(time.monotonic() - start, 5.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
