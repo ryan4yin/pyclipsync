@@ -51,24 +51,19 @@ X_JPEG = "image/jpeg"
 X_HTML = "text/html"
 X_UTF8 = "UTF8_STRING"
 X_STRING = "STRING"
-X_TEXT = "TEXT"
 X_PLAIN = "text/plain"
 
-# Wayland mime types
+# Wayland mime types. Text is offered as either text/plain or the
+# charset-qualified form (Qt, GTK and Chromium all use the latter), so read both
+# and prefer UTF-8. UTF8_STRING/TEXT/STRING are X11 atom names, not Wayland
+# types; GTK/Qt translate them to text/plain;charset=utf-8 on this side.
 W_TEXT = "text/plain"
 W_TEXT_UTF8 = "text/plain;charset=utf-8"
-W_UTF8_STRING = "UTF8_STRING"
-W_TEXT_LEGACY = "TEXT"
-W_STRING = "STRING"
 W_PNG = "image/png"
 W_JPEG = "image/jpeg"
 W_HTML = "text/html"
 W_URI = "text/uri-list"
-# Clipboard text is offered under several distinct type strings, not one; a
-# reader must try them all, UTF-8 first (see Chromium's
-# ui/base/clipboard/clipboard_constants.h and wl-clipboard-rs MimeType::Text --
-# the X11-style names show up through Xwayland interop).
-W_TEXT_TYPES = (W_TEXT_UTF8, W_UTF8_STRING, W_TEXT, W_TEXT_LEGACY, W_STRING)
+W_TEXT_TYPES = (W_TEXT_UTF8, W_TEXT)
 # one wl-paste --watch thread per offered mime type
 W_WATCH_TYPES = [*W_TEXT_TYPES, W_PNG, W_JPEG, W_HTML, W_URI]
 
@@ -92,7 +87,7 @@ X_TARGETS = {
 # Types this tool knows how to read. Used only by the diagnostic below, so an
 # unrelated MIME (application/*, primary selection, ...) does not warn.
 W_SUPPORTED = set(W_TEXT_TYPES) | {W_PNG, W_JPEG, W_HTML, W_URI}
-X_SUPPORTED = {X_UTF8, X_STRING, X_TEXT, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
+X_SUPPORTED = {X_UTF8, X_STRING, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
 
 # Recycle each watcher child every N seconds. A helper can wedge (stay alive but
 # stop delivering events), which would otherwise stall sync until the whole
@@ -292,7 +287,7 @@ def x_state():
         data = x_read(X_HTML)
         if data:
             return ("html", data, h(data))
-    for target in (X_UTF8, X_PLAIN, X_STRING, X_TEXT):
+    for target in (X_UTF8, X_PLAIN, X_STRING):
         if target in targets:
             data = x_read(target)
             if data:
