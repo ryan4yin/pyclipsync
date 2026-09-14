@@ -31,6 +31,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_CMD = (
@@ -265,6 +266,138 @@ class SyncTest(unittest.TestCase):
         warns = [l for l in log.splitlines() if " WARNING " in l]
         if warns:
             print("\npyclipsync warnings (non-fatal):\n" + "\n".join(warns))
+
+
+class UnreadableOfferLogTest(unittest.TestCase):
+    """Unit tests for the unreadable-offer diagnostic (no live session needed)."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+        pyclipsync._miss_log.clear()
+
+    def test_supported_unreadable_offer_is_logged(self):
+        with self.assertLogs("pyclipsync", level="WARNING") as cm:
+            self.pc._log_unreadable(
+                "Wayland clipboard",
+                {"image/png", "text/plain"},
+                self.pc.W_SUPPORTED,
+            )
+        self.assertIn("image/png", cm.output[0])
+
+    def test_unknown_offers_are_ignored(self):
+        with self.assertNoLogs("pyclipsync", level="WARNING"):
+            self.pc._log_unreadable(
+                "Wayland clipboard", {"application/x-foo"}, self.pc.W_SUPPORTED
+            )
+
+    def test_repeated_identical_offer_is_throttled(self):
+        with self.assertLogs("pyclipsync", level="WARNING"):
+            self.pc._log_unreadable(
+                "Wayland clipboard", {"image/png"}, self.pc.W_SUPPORTED
+            )
+        with self.assertNoLogs("pyclipsync", level="WARNING"):
+            self.pc._log_unreadable(
+                "Wayland clipboard", {"image/png"}, self.pc.W_SUPPORTED
+            )
+
+
+class WatchRecycleTest(unittest.TestCase):
+    """Unit tests for the watcher recycle helper (no live session needed)."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_recycles_a_hung_command(self):
+        events = []
+        start = time.monotonic()
+        self.pc._watch_once(
+            ["sh", "-c", "echo tick; sleep 30"], lambda: events.append(1), 0.3
+        )
+        self.assertEqual(events, [1])
+        self.assertLess(time.monotonic() - start, 5.0)
+
+    def test_returns_when_command_exits(self):
+        events = []
+        start = time.monotonic()
+        self.pc._watch_once(["sh", "-c", "echo once"], lambda: events.append(1), 30)
+        self.assertEqual(events, [1])
+        self.assertLess(time.monotonic() - start, 5.0)
+
+
+class WatchLoopTest(unittest.TestCase):
+    """Unit tests for the resilient watcher loop (no live session needed)."""
+
+    class _Stop(BaseException):
+        """Raised by fake watchers to break out of the otherwise infinite loop."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_survives_failures(self):
+        calls = []
+
+        def once():
+            calls.append(1)
+            if len(calls) >= 3:
+                raise self._Stop
+            raise RuntimeError("boom")
+
+        with patch.object(self.pc.time, "sleep", lambda _d: None), patch.object(
+            self.pc.log, "exception"
+        ):
+            with self.assertRaises(self._Stop):
+                self.pc._watch_loop(once, "test")
+        self.assertEqual(len(calls), 3)
+
+    def test_backoff_doubles_until_a_long_run_resets_it(self):
+        sleeps = []
+        calls = []
+
+        def once():
+            calls.append(1)
+            if len(calls) >= 4:
+                raise self._Stop
+            raise RuntimeError("boom")
+
+        with patch.object(self.pc.time, "sleep", sleeps.append), patch.object(
+            self.pc.log, "exception"
+        ):
+            with self.assertRaises(self._Stop):
+                self.pc._watch_loop(once, "test")
+        self.assertEqual(sleeps, [0.2, 0.4, 0.8])
+
+
+class WStateTextTest(unittest.TestCase):
+    """w_state() must read charset-qualified text, not just bare text/plain."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_reads_each_text_variant(self):
+        for mime in self.pc.W_TEXT_TYPES:
+            with self.subTest(mime=mime):
+                with patch.object(
+                    self.pc, "wl_types", return_value={mime}
+                ), patch.object(self.pc, "wl_read", return_value=b"hi"):
+                    state = self.pc.w_state()
+                self.assertIsNotNone(state)
+                self.assertEqual(state[0], "text")
 
 
 if __name__ == "__main__":

@@ -53,14 +53,19 @@ X_UTF8 = "UTF8_STRING"
 X_STRING = "STRING"
 X_PLAIN = "text/plain"
 
-# Wayland mime types
+# Wayland mime types. Text is offered as either text/plain or the
+# charset-qualified form (Qt, GTK and Chromium all use the latter), so read both
+# and prefer UTF-8. UTF8_STRING/TEXT/STRING are X11 atom names, not Wayland
+# types; GTK/Qt translate them to text/plain;charset=utf-8 on this side.
 W_TEXT = "text/plain"
+W_TEXT_UTF8 = "text/plain;charset=utf-8"
 W_PNG = "image/png"
 W_JPEG = "image/jpeg"
 W_HTML = "text/html"
 W_URI = "text/uri-list"
+W_TEXT_TYPES = (W_TEXT_UTF8, W_TEXT)
 # one wl-paste --watch thread per offered mime type
-W_WATCH_TYPES = [W_TEXT, W_PNG, W_JPEG, W_HTML, W_URI]
+W_WATCH_TYPES = [*W_TEXT_TYPES, W_PNG, W_JPEG, W_HTML, W_URI]
 
 # kind -> target/mime per direction (uri-list always maps to text/uri-list on
 # both sides; that is what WeChat and QQ read for pasted file/image links)
@@ -78,6 +83,24 @@ X_TARGETS = {
     "jpeg": X_JPEG,
     "html": X_HTML,
 }
+
+# Types this tool knows how to read. Used only by the diagnostic below, so an
+# unrelated MIME (application/*, primary selection, ...) does not warn.
+W_SUPPORTED = set(W_TEXT_TYPES) | {W_PNG, W_JPEG, W_HTML, W_URI}
+X_SUPPORTED = {X_UTF8, X_STRING, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
+
+# Recycle each watcher child every N seconds. A helper can wedge (stay alive but
+# stop delivering events), which would otherwise stall sync until the whole
+# service is restarted; bounding its lifetime makes it self-heal. Env-overridable
+# for tuning and tests.
+WATCH_RECYCLE_SECONDS = float(os.environ.get("WATCH_RECYCLE_SECONDS", "3600"))
+
+# Watcher retry policy: a watcher loop must survive helper failures without
+# dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
+# `delay`, which doubles up to WATCH_BACKOFF_MAX; a run that lasted at least
+# WATCH_BACKOFF_MAX (e.g. a clean recycle) resets the backoff.
+WATCH_BACKOFF_MIN = 0.2
+WATCH_BACKOFF_MAX = 30.0
 
 
 def run(cmd: list[str], data: bytes | None = None, timeout: float = 5.0):
@@ -198,6 +221,38 @@ def h(data: bytes | None) -> str:
     return hashlib.sha256(data or b"").hexdigest()
 
 
+# Throttle for the unreadable-offer diagnostic: the 1s pollers call the state
+# readers continuously, so log at most once per distinct offer set per window
+# instead of flooding the journal.
+_MISS_LOG_INTERVAL = 30.0
+_miss_log: dict[str, tuple[frozenset[str], float]] = {}
+
+
+def _log_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
+    """Warn (throttled) when a supported type is offered but cannot be read.
+
+    Reading is best-effort: `wl-paste`/`xclip` can return nothing even though
+    the selection advertises a type we handle -- e.g. a client that keeps
+    selection ownership but refuses to serve a background/data-control reader
+    (observed with Chromium on Wayland). Without this the miss is silent: no
+    sync happens and no log line says why.
+    """
+    stuck = offered & supported
+    if not stuck:
+        return
+    now = time.monotonic()
+    prev = _miss_log.get(side)
+    if prev is not None and prev[0] == frozenset(stuck) and now - prev[1] < _MISS_LOG_INTERVAL:
+        return
+    _miss_log[side] = (frozenset(stuck), now)
+    log.warning(
+        "%s: %d supported type(s) offered but unreadable, sync skipped: %s",
+        side,
+        len(stuck),
+        " ".join(sorted(stuck)),
+    )
+
+
 def x_state():
     """Read the X11 CLIPBOARD. Returns (kind, data, digest) or None.
 
@@ -237,6 +292,7 @@ def x_state():
             data = x_read(target)
             if data:
                 return ("text", data, h(data))
+    _log_unreadable("X11 clipboard", targets, X_SUPPORTED)
     return None
 
 
@@ -264,10 +320,12 @@ def w_state():
         data = wl_read(W_HTML)
         if data:
             return ("html", data, h(data))
-    if W_TEXT in types:
-        data = wl_read(W_TEXT)
-        if data:
-            return ("text", data, h(data))
+    for text_mime in W_TEXT_TYPES:
+        if text_mime in types:
+            data = wl_read(text_mime)
+            if data:
+                return ("text", data, h(data))
+    _log_unreadable("Wayland clipboard", types, W_SUPPORTED)
     return None
 
 
@@ -346,6 +404,25 @@ class Syncer:
                 self.last_x = x_state() or state
 
 
+def _watch_loop(run_once, name: str) -> None:
+    """Run run_once() forever, surviving failures with capped backoff.
+
+    A watcher must never die silently (that would stall its direction until a
+    service restart) and must not hot-loop when the helper fails immediately.
+    """
+    delay = WATCH_BACKOFF_MIN
+    while True:
+        started = time.monotonic()
+        try:
+            run_once()
+        except Exception:  # noqa: BLE001 - a watcher must never die
+            log.exception("%s failed", name)
+        if time.monotonic() - started >= WATCH_BACKOFF_MAX:
+            delay = WATCH_BACKOFF_MIN
+        time.sleep(delay)
+        delay = min(delay * 2, WATCH_BACKOFF_MAX)
+
+
 def watch_clipnotify(syncer: Syncer):
     """X -> W: forward each X11 selection owner change.
 
@@ -361,18 +438,21 @@ def watch_clipnotify(syncer: Syncer):
     if clipnotify is None:
         log.error("clipnotify not found in PATH; X -> W sync disabled")
         return
-    while True:
+
+    def once() -> None:
         try:
             subprocess.run(
                 [clipnotify],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=WATCH_RECYCLE_SECONDS,
             )
-        except (subprocess.SubprocessError, OSError) as e:
-            log.debug("clipnotify run failed: %s", e)
-            time.sleep(0.2)
-            continue
+        except subprocess.TimeoutExpired:
+            # No X selection change for a whole interval: just recycle.
+            return
         syncer.on_x_change()
+
+    _watch_loop(once, "clipnotify")
 
 
 def watch_x_poll(syncer: Syncer, interval: float = 1.0):
@@ -410,6 +490,33 @@ def watch_w_poll(syncer: Syncer, interval: float = 1.0):
             log.exception("w poll failed")
 
 
+def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
+    """Run `cmd`, call on_event() per stdout line, then recycle the child.
+
+    Returns when the command exits on its own or after `recycle` seconds, so
+    the caller can restart it. Bounding a watcher's lifetime is what lets the
+    daemon recover from a wedged helper without detecting the wedge: a fresh
+    child is spawned on every call.
+    """
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
+        recycler = threading.Timer(recycle, p.terminate)
+        recycler.daemon = True
+        recycler.start()
+        try:
+            assert p.stdout is not None
+            for _ in p.stdout:
+                on_event()
+        finally:
+            recycler.cancel()
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=2)
+
+
 def watch_wayland(syncer: Syncer, mime: str):
     """W -> X: forward each Wayland clipboard offer of the given mime type.
 
@@ -418,15 +525,20 @@ def watch_wayland(syncer: Syncer, mime: str):
     the given type appears. We use bare `echo`, which ignores stdin and
     prints a single newline per offer -- a pure change signal. We re-read
     the full state afterwards.
+
+    The watch child is recycled every WATCH_RECYCLE_SECONDS (see _watch_once)
+    so a wedged watcher cannot silently stall W -> X sync; an offer missed in
+    the brief restart gap is caught by watch_w_poll.
     """
-    with subprocess.Popen(
-        ["wl-paste", "--type", mime, "--watch", "echo"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    ) as p:
-        assert p.stdout is not None
-        for _ in p.stdout:
-            syncer.on_w_change()
+    cmd = ["wl-paste", "--type", mime, "--watch", "echo"]
+
+    def on_event() -> None:
+        log.debug("watch %s: new offer", mime)
+        syncer.on_w_change()
+
+    _watch_loop(
+        lambda: _watch_once(cmd, on_event, WATCH_RECYCLE_SECONDS), f"watch {mime}"
+    )
 
 
 def main():
