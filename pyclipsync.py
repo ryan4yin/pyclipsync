@@ -146,6 +146,10 @@ def run(cmd: list[str], data: bytes | None = None, timeout: float = CLIPBOARD_TI
     try:
         r = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
         return r.returncode, r.stdout
+    except subprocess.TimeoutExpired:
+        # Distinguish a hung helper from an empty clipboard in the logs.
+        log.warning("%s timed out after %ss", cmd[0], timeout)
+        return None, b""
     except (subprocess.SubprocessError, OSError) as e:
         log.debug("%s failed: %s", cmd[0], e)
         return None, b""
@@ -206,16 +210,31 @@ def _unregister_watcher(p: subprocess.Popen) -> None:
         _watcher_procs.discard(p)
 
 
+def _terminate_proc(p: subprocess.Popen) -> None:
+    """Terminate a child, escalating to SIGKILL; never raises."""
+    try:
+        p.terminate()
+    except OSError:
+        return
+    try:
+        p.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
+            p.wait(timeout=2)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    except OSError:
+        pass
+
+
 def _cleanup_watchers() -> None:
     """Terminate the watcher children we spawned (best effort)."""
     with _watcher_lock:
         procs = list(_watcher_procs)
         _watcher_procs.clear()
     for p in procs:
-        try:
-            p.terminate()
-        except OSError:
-            pass
+        _terminate_proc(p)
 
 
 def _spawn_owner(cmd: list[str], data: bytes) -> bool:
@@ -566,12 +585,7 @@ def watch_clipnotify(syncer: Syncer):
         finally:
             _unregister_watcher(p)
             if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait(timeout=2)
+                _terminate_proc(p)
         syncer.on_x_change()
 
     _watch_loop(once, "clipnotify")
@@ -633,12 +647,7 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
             _unregister_watcher(p)
             recycler.cancel()
             if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait(timeout=2)
+                _terminate_proc(p)
 
 
 def watch_wayland(syncer: Syncer, mime: str):
@@ -675,16 +684,10 @@ def _handle_shutdown(signum, _frame) -> None:
 
 def main():
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    if os.environ.get("DEBUG"):
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s %(levelname)s %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
 
     if shutil.which("wl-copy") is None or shutil.which("wl-paste") is None:
         log.error("wl-clipboard (wl-copy/wl-paste) not found in PATH")

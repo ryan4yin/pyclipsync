@@ -531,6 +531,9 @@ class WatcherLifecycleTest(unittest.TestCase):
             def terminate(self):
                 self.terminated = True
 
+            def wait(self, timeout=None):
+                return 0
+
         a, b = FakeProc(), FakeProc()
         with self.pc._watcher_lock:
             self.pc._watcher_procs.update({a, b})
@@ -539,6 +542,89 @@ class WatcherLifecycleTest(unittest.TestCase):
         self.assertTrue(b.terminated)
         with self.pc._watcher_lock:
             self.assertEqual(self.pc._watcher_procs, set())
+
+
+class SyncerTest(unittest.TestCase):
+    """Unit tests for the dedup / loop-prevention state machine."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+        self.syncer = pyclipsync.Syncer()
+
+    def state(self, data: bytes, kind: str = "text"):
+        return (kind, data, self.pc.h(data))
+
+    def test_w2x_pushes_and_records_measured_destination(self):
+        src = self.state(b"hi")
+        measured = self.state(b"hi\n")
+        with patch.object(self.pc, "w_state", return_value=src), patch.object(
+            self.pc, "x_state", return_value=measured
+        ), patch.object(self.pc, "push_w_to_x", return_value=True) as push:
+            self.syncer.on_w_change()
+        push.assert_called_once_with(src)
+        self.assertEqual(self.syncer.last_w, src)
+        self.assertEqual(self.syncer.last_x, measured)
+
+    def test_w2x_dedup_skips_unchanged(self):
+        src = self.state(b"hi")
+        self.syncer.last_w = src
+        with patch.object(self.pc, "w_state", return_value=src), patch.object(
+            self.pc, "push_w_to_x", return_value=True
+        ) as push:
+            self.syncer.on_w_change()
+        push.assert_not_called()
+
+    def test_w2x_skips_when_already_on_x(self):
+        src = self.state(b"hi")
+        self.syncer.last_x = src
+        with patch.object(self.pc, "w_state", return_value=src), patch.object(
+            self.pc, "push_w_to_x", return_value=True
+        ) as push:
+            self.syncer.on_w_change()
+        push.assert_not_called()
+
+    def test_w2x_empty_is_ignored(self):
+        with patch.object(self.pc, "w_state", return_value=None), patch.object(
+            self.pc, "push_w_to_x"
+        ) as push:
+            self.syncer.on_w_change()
+        push.assert_not_called()
+        self.assertIsNone(self.syncer.last_w)
+        self.assertIsNone(self.syncer.last_x)
+
+    def test_w2x_failed_push_is_not_recorded(self):
+        src = self.state(b"hi")
+        with patch.object(self.pc, "w_state", return_value=src), patch.object(
+            self.pc, "push_w_to_x", return_value=False
+        ) as push:
+            self.syncer.on_w_change()
+        push.assert_called_once_with(src)
+        self.assertIsNone(self.syncer.last_w)
+        self.assertIsNone(self.syncer.last_x)
+
+    def test_x2w_pushes_and_records_measured_destination(self):
+        src = self.state(b"hello")
+        measured = self.state(b"hello\n")
+        with patch.object(self.pc, "x_state", return_value=src), patch.object(
+            self.pc, "w_state", return_value=measured
+        ), patch.object(self.pc, "push_x_to_w", return_value=True) as push:
+            self.syncer.on_x_change()
+        push.assert_called_once_with(src)
+        self.assertEqual(self.syncer.last_x, src)
+        self.assertEqual(self.syncer.last_w, measured)
+
+    def test_x2w_dedup_skips_unchanged(self):
+        src = self.state(b"hello")
+        self.syncer.last_x = src
+        with patch.object(self.pc, "x_state", return_value=src), patch.object(
+            self.pc, "push_x_to_w", return_value=True
+        ) as push:
+            self.syncer.on_x_change()
+        push.assert_not_called()
 
 
 if __name__ == "__main__":
