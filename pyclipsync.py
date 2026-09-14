@@ -173,6 +173,29 @@ def _kill_group(pgid: int, sig: int) -> None:
         pass
 
 
+def _group_alive(pgid: int) -> bool:
+    """True if a process group with this id still exists."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _prune_owners() -> None:
+    """Forget owner groups that no longer exist.
+
+    A recorded pgid can be recycled by the kernel once its owner exits, so
+    keeping dead entries around risks signalling an unrelated group later.
+    """
+    with _owner_lock:
+        dead = [pgid for pgid in _owner_pgids if not _group_alive(pgid)]
+        for pgid in dead:
+            _owner_pgids.discard(pgid)
+
+
 def _register_watcher(p: subprocess.Popen) -> None:
     with _watcher_lock:
         _watcher_procs.add(p)
@@ -227,6 +250,7 @@ def _spawn_owner(cmd: list[str], data: bytes) -> bool:
     if p.returncode != 0:
         log.debug("%s exited with %s", cmd[0], p.returncode)
         return False
+    _prune_owners()
     with _owner_lock:
         _owner_pgids.add(p.pid)
     return True
@@ -238,7 +262,8 @@ def _cleanup_owners() -> None:
         pgids = list(_owner_pgids)
         _owner_pgids.clear()
     for pgid in pgids:
-        _kill_group(pgid, signal.SIGTERM)
+        if _group_alive(pgid):
+            _kill_group(pgid, signal.SIGTERM)
 
 
 def wl_copy(mime: str, data: bytes) -> bool:
@@ -310,7 +335,7 @@ def h(data: bytes | None) -> str:
     return hashlib.sha256(data or b"").hexdigest()
 
 
-# Throttle for the unreadable-offer diagnostic: the 1s pollers call the state
+# Throttle for the unreadable-offer diagnostic: the pollers call the state
 # readers continuously, so log at most once per distinct offer set per window
 # instead of flooding the journal.
 _MISS_LOG_INTERVAL = 30.0
