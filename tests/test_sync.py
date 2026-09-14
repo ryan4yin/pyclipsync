@@ -464,17 +464,47 @@ class OwnerLifecycleTest(unittest.TestCase):
         with self.pc._owner_lock:
             self.assertEqual(self.pc._owner_pgids, set())
 
-    def test_cleanup_kills_and_clears(self):
+    def test_group_alive(self):
+        with patch.object(self.pc.os, "killpg", side_effect=ProcessLookupError):
+            self.assertFalse(self.pc._group_alive(1))
+        with patch.object(self.pc.os, "killpg", side_effect=PermissionError):
+            self.assertTrue(self.pc._group_alive(1))
+        with patch.object(self.pc.os, "killpg"):
+            self.assertTrue(self.pc._group_alive(1))
+
+    def test_prune_owners_drops_dead_groups(self):
+        with self.pc._owner_lock:
+            self.pc._owner_pgids.update({111, 222})
+        with patch.object(
+            self.pc, "_group_alive", side_effect=lambda pgid: pgid == 222
+        ):
+            self.pc._prune_owners()
+        with self.pc._owner_lock:
+            self.assertEqual(self.pc._owner_pgids, {222})
+
+    def test_cleanup_kills_live_groups(self):
         with self.pc._owner_lock:
             self.pc._owner_pgids.update({111111, 222222})
         killed = []
-        with patch.object(
-            self.pc.os, "killpg", side_effect=lambda pid, _sig: killed.append(pid)
+        with patch.object(self.pc, "_group_alive", return_value=True), patch.object(
+            self.pc, "_kill_group", side_effect=lambda pgid, _sig: killed.append(pgid)
         ):
             self.pc._cleanup_owners()
         self.assertEqual(sorted(killed), [111111, 222222])
         with self.pc._owner_lock:
             self.assertEqual(self.pc._owner_pgids, set())
+
+    def test_cleanup_skips_dead_groups(self):
+        with self.pc._owner_lock:
+            self.pc._owner_pgids.update({111111, 222222})
+        killed = []
+        with patch.object(
+            self.pc, "_group_alive", side_effect=lambda pgid: pgid == 222222
+        ), patch.object(
+            self.pc, "_kill_group", side_effect=lambda pgid, _sig: killed.append(pgid)
+        ):
+            self.pc._cleanup_owners()
+        self.assertEqual(killed, [222222])
 
 
 class WatcherLifecycleTest(unittest.TestCase):
