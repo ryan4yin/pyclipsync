@@ -31,6 +31,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_CMD = (
@@ -329,6 +330,72 @@ class WatchRecycleTest(unittest.TestCase):
         self.pc._watch_once(["sh", "-c", "echo once"], lambda: events.append(1), 30)
         self.assertEqual(events, [1])
         self.assertLess(time.monotonic() - start, 5.0)
+
+
+class WatchLoopTest(unittest.TestCase):
+    """Unit tests for the resilient watcher loop (no live session needed)."""
+
+    class _Stop(BaseException):
+        """Raised by fake watchers to break out of the otherwise infinite loop."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_survives_failures(self):
+        calls = []
+
+        def once():
+            calls.append(1)
+            if len(calls) >= 3:
+                raise self._Stop
+            raise RuntimeError("boom")
+
+        with patch.object(self.pc.time, "sleep", lambda _d: None), patch.object(
+            self.pc.log, "exception"
+        ):
+            with self.assertRaises(self._Stop):
+                self.pc._watch_loop(once, "test")
+        self.assertEqual(len(calls), 3)
+
+    def test_backoff_doubles_until_a_long_run_resets_it(self):
+        sleeps = []
+        calls = []
+
+        def once():
+            calls.append(1)
+            if len(calls) >= 4:
+                raise self._Stop
+            raise RuntimeError("boom")
+
+        with patch.object(self.pc.time, "sleep", sleeps.append), patch.object(
+            self.pc.log, "exception"
+        ):
+            with self.assertRaises(self._Stop):
+                self.pc._watch_loop(once, "test")
+        self.assertEqual(sleeps, [0.2, 0.4, 0.8])
+
+
+class WStateTextTest(unittest.TestCase):
+    """w_state() must read charset-qualified text, not just bare text/plain."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_reads_charset_qualified_text(self):
+        with patch.object(
+            self.pc, "wl_types", return_value={"text/plain;charset=utf-8"}
+        ), patch.object(self.pc, "wl_read", return_value=b"hi"):
+            state = self.pc.w_state()
+        self.assertIsNotNone(state)
+        self.assertEqual(state[0], "text")
 
 
 if __name__ == "__main__":
