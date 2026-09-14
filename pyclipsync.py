@@ -43,6 +43,23 @@ import time
 
 log = logging.getLogger("pyclipsync")
 
+
+def _env_seconds(name: str, default: float) -> float:
+    """Read a positive float from the environment, falling back to `default`."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number, using %s", name, raw, default)
+        return default
+    if value <= 0:
+        log.warning("%s must be > 0, using %s", name, default)
+        return default
+    return value
+
+
 # X11 atoms
 X_URI = "text/uri-list"
 X_GNOME_FILES = "x-special/gnome-copied-files"
@@ -93,7 +110,16 @@ X_SUPPORTED = {X_UTF8, X_STRING, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_
 # stop delivering events), which would otherwise stall sync until the whole
 # service is restarted; bounding its lifetime makes it self-heal. Env-overridable
 # for tuning and tests.
-WATCH_RECYCLE_SECONDS = float(os.environ.get("WATCH_RECYCLE_SECONDS", "3600"))
+WATCH_RECYCLE_SECONDS = _env_seconds("WATCH_RECYCLE_SECONDS", 3600.0)
+
+# Timeout for a single clipboard helper call. The syncer lock is held across
+# these calls, so a hung helper stalls both directions; keep it short so the
+# stall is bounded (a read that times out also trips the unreadable-offer log).
+CLIPBOARD_TIMEOUT = _env_seconds("CLIPBOARD_TIMEOUT", 3.0)
+
+# Poller interval. Watchers are event-driven; the pollers are only a safety net
+# for missed events, so this can be coarse, which keeps idle CPU low.
+POLL_INTERVAL_SECONDS = _env_seconds("POLL_INTERVAL_SECONDS", 5.0)
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
@@ -102,8 +128,20 @@ WATCH_RECYCLE_SECONDS = float(os.environ.get("WATCH_RECYCLE_SECONDS", "3600"))
 WATCH_BACKOFF_MIN = 0.2
 WATCH_BACKOFF_MAX = 30.0
 
+# Clipboard owners we spawned. wl-copy/xclip fork a child that keeps serving the
+# selection; that child outlives us, so track its process group and kill it on
+# shutdown instead of leaving a stale owner behind after a restart.
+_owner_pgids: set[int] = set()
+_owner_lock = threading.Lock()
 
-def run(cmd: list[str], data: bytes | None = None, timeout: float = 5.0):
+# Watcher children (wl-paste --watch, clipnotify). They are also reparented and
+# would keep running if we exit, so terminate them on shutdown too. (Under
+# systemd the cgroup kill covers this, but not when run by hand.)
+_watcher_procs: set[subprocess.Popen] = set()
+_watcher_lock = threading.Lock()
+
+
+def run(cmd: list[str], data: bytes | None = None, timeout: float = CLIPBOARD_TIMEOUT):
     """Run a command. Returns (returncode, stdout). Never raises."""
     try:
         r = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
@@ -127,13 +165,87 @@ def wl_read(mime: str) -> bytes | None:
     return None
 
 
+def _kill_group(pgid: int, sig: int) -> None:
+    """Signal a process group we created, ignoring an already-gone group."""
+    try:
+        os.killpg(pgid, sig)
+    except OSError:
+        pass
+
+
+def _register_watcher(p: subprocess.Popen) -> None:
+    with _watcher_lock:
+        _watcher_procs.add(p)
+
+
+def _unregister_watcher(p: subprocess.Popen) -> None:
+    with _watcher_lock:
+        _watcher_procs.discard(p)
+
+
+def _cleanup_watchers() -> None:
+    """Terminate the watcher children we spawned (best effort)."""
+    with _watcher_lock:
+        procs = list(_watcher_procs)
+        _watcher_procs.clear()
+    for p in procs:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+
+
+def _spawn_owner(cmd: list[str], data: bytes) -> bool:
+    """Run a clipboard-owner command and remember its process group.
+
+    wl-copy and xclip fork a child that keeps serving the selection after the
+    parent exits; that child outlives us and would keep owning the clipboard
+    with stale data. Running it in its own session lets _cleanup_owners kill the
+    whole group on shutdown.
+    """
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        log.debug("%s failed: %s", cmd[0], e)
+        return False
+    try:
+        p.communicate(input=data, timeout=CLIPBOARD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # Kill the whole group: the direct child may already have forked the
+        # owner child that holds the selection.
+        _kill_group(p.pid, signal.SIGKILL)
+        p.kill()
+        p.communicate()
+        log.warning("%s did not return within %ss", cmd[0], CLIPBOARD_TIMEOUT)
+        return False
+    if p.returncode != 0:
+        log.debug("%s exited with %s", cmd[0], p.returncode)
+        return False
+    with _owner_lock:
+        _owner_pgids.add(p.pid)
+    return True
+
+
+def _cleanup_owners() -> None:
+    """Kill the clipboard-owner process groups we spawned (best effort)."""
+    with _owner_lock:
+        pgids = list(_owner_pgids)
+        _owner_pgids.clear()
+    for pgid in pgids:
+        _kill_group(pgid, signal.SIGTERM)
+
+
 def wl_copy(mime: str, data: bytes) -> bool:
     """Write the Wayland clipboard.
 
-    wl-copy (like xclip) keeps a background child alive to serve the data;
-    that child inherits stdout/stderr, so capture_output would block until
-    timeout even though the data was already delivered. Point them at
-    /dev/null so the call returns as soon as the parent exits.
+    wl-copy forks a background child that holds the selection; it inherits
+    stdout/stderr, so those go to /dev/null (see _spawn_owner).
 
     wl-copy also appends exactly one trailing newline to piped text/* input.
     To keep the Wayland clipboard clean (a single trailing newline, no empty
@@ -142,18 +254,7 @@ def wl_copy(mime: str, data: bytes) -> bool:
     """
     if mime.startswith("text/") and data.endswith(b"\n"):
         data = data[:-1]
-    try:
-        r = subprocess.run(
-            ["wl-copy", "--type", mime],
-            input=data,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5.0,
-        )
-        return r.returncode == 0
-    except (subprocess.SubprocessError, OSError) as e:
-        log.debug("wl-copy %s failed: %s", mime, e)
-        return False
+    return _spawn_owner(["wl-copy", "--type", mime], data)
 
 
 def x_targets() -> set[str]:
@@ -173,24 +274,12 @@ def x_read(target: str) -> bytes | None:
 def x_set(target: str, data: bytes) -> bool:
     """Write the X CLIPBOARD.
 
-    xclip forks a background child to hold the selection and serve
-    SelectionRequests. That child inherits stdout/stderr, so we must NOT use
-    capture_output (pipes) here: subprocess.run would block on those pipes
-    until the owner child exits (or the timeout fires). Pointing them at
-    /dev/null makes the call return as soon as the parent forks.
+    xclip forks a background child that holds the selection and answers
+    SelectionRequests; see _spawn_owner. stdout/stderr go to /dev/null so the
+    call returns as soon as the parent forks (using pipes would block until the
+    owner child exits).
     """
-    try:
-        r = subprocess.run(
-            ["xclip", "-selection", "clipboard", "-t", target],
-            input=data,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5.0,
-        )
-        return r.returncode == 0
-    except (subprocess.SubprocessError, OSError) as e:
-        log.debug("xclip set %s failed: %s", target, e)
-        return False
+    return _spawn_owner(["xclip", "-selection", "clipboard", "-t", target], data)
 
 
 def normalize_uri(data: bytes) -> bytes:
@@ -440,22 +529,30 @@ def watch_clipnotify(syncer: Syncer):
         return
 
     def once() -> None:
+        p = subprocess.Popen(
+            [clipnotify], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        _register_watcher(p)
         try:
-            subprocess.run(
-                [clipnotify],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=WATCH_RECYCLE_SECONDS,
-            )
+            p.wait(timeout=WATCH_RECYCLE_SECONDS)
         except subprocess.TimeoutExpired:
             # No X selection change for a whole interval: just recycle.
             return
+        finally:
+            _unregister_watcher(p)
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=2)
         syncer.on_x_change()
 
     _watch_loop(once, "clipnotify")
 
 
-def watch_x_poll(syncer: Syncer, interval: float = 1.0):
+def watch_x_poll(syncer: Syncer, interval: float = POLL_INTERVAL_SECONDS):
     """X -> W safety net.
 
     The clipnotify relaunch loop has a small registration gap (between one
@@ -473,7 +570,7 @@ def watch_x_poll(syncer: Syncer, interval: float = 1.0):
             log.exception("x poll failed")
 
 
-def watch_w_poll(syncer: Syncer, interval: float = 1.0):
+def watch_w_poll(syncer: Syncer, interval: float = POLL_INTERVAL_SECONDS):
     """W -> X safety net, symmetric to watch_x_poll.
 
     wl-paste --watch only fires on *new* offers; if a W -> X push fails
@@ -499,6 +596,7 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
     child is spawned on every call.
     """
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
+        _register_watcher(p)
         recycler = threading.Timer(recycle, p.terminate)
         recycler.daemon = True
         recycler.start()
@@ -507,6 +605,7 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
             for _ in p.stdout:
                 on_event()
         finally:
+            _unregister_watcher(p)
             recycler.cancel()
             if p.poll() is None:
                 p.terminate()
@@ -541,6 +640,14 @@ def watch_wayland(syncer: Syncer, mime: str):
     )
 
 
+_shutdown = threading.Event()
+
+
+def _handle_shutdown(signum, _frame) -> None:
+    log.info("received signal %s, shutting down", signum)
+    _shutdown.set()
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -558,15 +665,24 @@ def main():
         log.error("wl-clipboard (wl-copy/wl-paste) not found in PATH")
         sys.exit(1)
 
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
     syncer = Syncer()
     threading.Thread(
         target=watch_clipnotify, args=(syncer,), daemon=True, name="x2w"
     ).start()
     threading.Thread(
-        target=watch_x_poll, args=(syncer,), daemon=True, name="x2w-poll"
+        target=watch_x_poll,
+        args=(syncer, POLL_INTERVAL_SECONDS),
+        daemon=True,
+        name="x2w-poll",
     ).start()
     threading.Thread(
-        target=watch_w_poll, args=(syncer,), daemon=True, name="w2x-poll"
+        target=watch_w_poll,
+        args=(syncer, POLL_INTERVAL_SECONDS),
+        daemon=True,
+        name="w2x-poll",
     ).start()
     for mime in W_WATCH_TYPES:
         threading.Thread(
@@ -578,7 +694,9 @@ def main():
         os.environ.get("DISPLAY"),
         os.environ.get("WAYLAND_DISPLAY"),
     )
-    threading.Event().wait()
+    _shutdown.wait()
+    _cleanup_watchers()
+    _cleanup_owners()
 
 
 if __name__ == "__main__":

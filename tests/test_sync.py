@@ -319,7 +319,7 @@ class WatchRecycleTest(unittest.TestCase):
         events = []
         start = time.monotonic()
         self.pc._watch_once(
-            ["sh", "-c", "echo tick; sleep 30"], lambda: events.append(1), 0.3
+            ["sh", "-c", "echo tick; exec sleep 30"], lambda: events.append(1), 0.3
         )
         self.assertEqual(events, [1])
         self.assertLess(time.monotonic() - start, 5.0)
@@ -398,6 +398,117 @@ class WStateTextTest(unittest.TestCase):
                     state = self.pc.w_state()
                 self.assertIsNotNone(state)
                 self.assertEqual(state[0], "text")
+
+
+class EnvSecondsTest(unittest.TestCase):
+    """Unit tests for the positive-float env parser."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+        self.name = "PYCLIPSYNC_TEST_SECONDS"
+
+    def test_unset_uses_default(self):
+        with patch.dict(self.pc.os.environ, {}, clear=False):
+            self.pc.os.environ.pop(self.name, None)
+            self.assertEqual(self.pc._env_seconds(self.name, 5.0), 5.0)
+
+    def test_value_is_parsed(self):
+        with patch.dict(self.pc.os.environ, {self.name: "2.5"}):
+            self.assertEqual(self.pc._env_seconds(self.name, 5.0), 2.5)
+
+    def test_bad_value_falls_back(self):
+        with patch.dict(self.pc.os.environ, {self.name: "abc"}), patch.object(
+            self.pc.log, "warning"
+        ):
+            self.assertEqual(self.pc._env_seconds(self.name, 5.0), 5.0)
+
+    def test_nonpositive_falls_back(self):
+        with patch.dict(self.pc.os.environ, {self.name: "0"}), patch.object(
+            self.pc.log, "warning"
+        ):
+            self.assertEqual(self.pc._env_seconds(self.name, 5.0), 5.0)
+
+
+class OwnerLifecycleTest(unittest.TestCase):
+    """Unit tests for spawning, tracking and cleaning up clipboard owners."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+        with pyclipsync._owner_lock:
+            pyclipsync._owner_pgids.clear()
+
+    def tearDown(self) -> None:
+        with self.pc._owner_lock:
+            self.pc._owner_pgids.clear()
+
+    def test_spawn_owner_records_process_group(self):
+        self.assertTrue(self.pc._spawn_owner(["sh", "-c", "exit 0"], b"data"))
+        with self.pc._owner_lock:
+            self.assertEqual(len(self.pc._owner_pgids), 1)
+
+    def test_spawn_owner_timeout_is_not_recorded(self):
+        with patch.object(self.pc, "CLIPBOARD_TIMEOUT", 0.2), patch.object(
+            self.pc.log, "warning"
+        ):
+            self.assertFalse(
+                self.pc._spawn_owner(["sh", "-c", "exec sleep 30"], b"data")
+            )
+        with self.pc._owner_lock:
+            self.assertEqual(self.pc._owner_pgids, set())
+
+    def test_cleanup_kills_and_clears(self):
+        with self.pc._owner_lock:
+            self.pc._owner_pgids.update({111111, 222222})
+        killed = []
+        with patch.object(
+            self.pc.os, "killpg", side_effect=lambda pid, _sig: killed.append(pid)
+        ):
+            self.pc._cleanup_owners()
+        self.assertEqual(sorted(killed), [111111, 222222])
+        with self.pc._owner_lock:
+            self.assertEqual(self.pc._owner_pgids, set())
+
+
+class WatcherLifecycleTest(unittest.TestCase):
+    """Unit tests for tracking and terminating watcher children."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+        with pyclipsync._watcher_lock:
+            pyclipsync._watcher_procs.clear()
+
+    def tearDown(self) -> None:
+        with self.pc._watcher_lock:
+            self.pc._watcher_procs.clear()
+
+    def test_cleanup_terminates_and_clears(self):
+        class FakeProc:
+            def __init__(self):
+                self.terminated = False
+
+            def terminate(self):
+                self.terminated = True
+
+        a, b = FakeProc(), FakeProc()
+        with self.pc._watcher_lock:
+            self.pc._watcher_procs.update({a, b})
+        self.pc._cleanup_watchers()
+        self.assertTrue(a.terminated)
+        self.assertTrue(b.terminated)
+        with self.pc._watcher_lock:
+            self.assertEqual(self.pc._watcher_procs, set())
 
 
 if __name__ == "__main__":
