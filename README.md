@@ -34,8 +34,8 @@ tool [clipsync](https://github.com/123hi123/clipsync):
 
 | direction      | watcher                                     | reader     | writer                 |
 | -------------- | ------------------------------------------- | ---------- | ---------------------- |
-| X11 -> Wayland | `clipnotify` relaunch loop + 1s poll        | `xclip`    | `wl-copy`              |
-| Wayland -> X11 | `wl-paste --watch` (one per mime) + 1s poll | `wl-paste` | `xclip` (CLIPBOARD owner) |
+| X11 -> Wayland | `clipnotify` relaunch loop + 5s poll        | `xclip`    | `wl-copy`              |
+| Wayland -> X11 | `wl-paste --watch` (one per mime) + 5s poll | `wl-paste` | `xclip` (CLIPBOARD owner) |
 
 Content types, highest priority wins (mapping follows
 [linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)):
@@ -46,7 +46,7 @@ Content types, highest priority wins (mapping follows
   stripped and bare absolute paths are rewritten to `file://` URIs
 - **`image/png`**, **`image/jpeg`** — same mime on both sides
 - **`text/html`** — QQ rich text, same mime on both sides
-- **text** — X11: `UTF8_STRING`; Wayland: `text/plain`
+- **text** — X11: `UTF8_STRING`; Wayland: `text/plain` or `text/plain;charset=utf-8`
 
 ## Why pyclipsync
 
@@ -63,7 +63,7 @@ pyclipsync adds what they lack:
 
 - **`text/html` both ways** (QQ rich text)
 - **a real state machine**: per-side sha256 digest, read + dedup + push
-  atomic under one lock, destination recorded from a readback, 1s pollers
+  atomic under one lock, destination recorded from a readback, 5s pollers
   retrying failed pushes
 - **no destructive pushes**: empty or unreadable sources are never
   propagated; unservable targets fall back to the next one
@@ -142,6 +142,12 @@ for every supported type in both directions, including the QQ sticker
 (`gnome-copied-files`) case and a rapid double-copy race. The whole suite
 skips when `DISPLAY` / `WAYLAND_DISPLAY` / the helper tools are missing; on
 failure the workdir is kept and the daemon log tail is printed.
+
+The same file also holds unit tests for the internals (unreadable-offer
+diagnostic, watcher recycle/backoff, the syncer state machine, owner/watcher
+cleanup). They need no graphical session, so only the integration class skips
+on a headless machine. `nix build` runs them via the package's `checkPhase`,
+and CI runs them on every push.
 
 ```sh
 # test the repo's pyclipsync.py
