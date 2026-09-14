@@ -389,13 +389,15 @@ class WStateTextTest(unittest.TestCase):
 
         self.pc = pyclipsync
 
-    def test_reads_charset_qualified_text(self):
-        with patch.object(
-            self.pc, "wl_types", return_value={"text/plain;charset=utf-8"}
-        ), patch.object(self.pc, "wl_read", return_value=b"hi"):
-            state = self.pc.w_state()
-        self.assertIsNotNone(state)
-        self.assertEqual(state[0], "text")
+    def test_reads_each_text_variant(self):
+        for mime in self.pc.W_TEXT_TYPES:
+            with self.subTest(mime=mime):
+                with patch.object(
+                    self.pc, "wl_types", return_value={mime}
+                ), patch.object(self.pc, "wl_read", return_value=b"hi"):
+                    state = self.pc.w_state()
+                self.assertIsNotNone(state)
+                self.assertEqual(state[0], "text")
 
 
 if __name__ == "__main__":

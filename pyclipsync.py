@@ -51,17 +51,26 @@ X_JPEG = "image/jpeg"
 X_HTML = "text/html"
 X_UTF8 = "UTF8_STRING"
 X_STRING = "STRING"
+X_TEXT = "TEXT"
 X_PLAIN = "text/plain"
 
 # Wayland mime types
 W_TEXT = "text/plain"
 W_TEXT_UTF8 = "text/plain;charset=utf-8"
+W_UTF8_STRING = "UTF8_STRING"
+W_TEXT_LEGACY = "TEXT"
+W_STRING = "STRING"
 W_PNG = "image/png"
 W_JPEG = "image/jpeg"
 W_HTML = "text/html"
 W_URI = "text/uri-list"
+# Clipboard text is offered under several distinct type strings, not one; a
+# reader must try them all, UTF-8 first (see Chromium's
+# ui/base/clipboard/clipboard_constants.h and wl-clipboard-rs MimeType::Text --
+# the X11-style names show up through Xwayland interop).
+W_TEXT_TYPES = (W_TEXT_UTF8, W_UTF8_STRING, W_TEXT, W_TEXT_LEGACY, W_STRING)
 # one wl-paste --watch thread per offered mime type
-W_WATCH_TYPES = [W_TEXT, W_TEXT_UTF8, W_PNG, W_JPEG, W_HTML, W_URI]
+W_WATCH_TYPES = [*W_TEXT_TYPES, W_PNG, W_JPEG, W_HTML, W_URI]
 
 # kind -> target/mime per direction (uri-list always maps to text/uri-list on
 # both sides; that is what WeChat and QQ read for pasted file/image links)
@@ -82,21 +91,21 @@ X_TARGETS = {
 
 # Types this tool knows how to read. Used only by the diagnostic below, so an
 # unrelated MIME (application/*, primary selection, ...) does not warn.
-W_SUPPORTED = {W_TEXT, W_TEXT_UTF8, W_PNG, W_JPEG, W_HTML, W_URI}
-X_SUPPORTED = {X_UTF8, X_STRING, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
+W_SUPPORTED = set(W_TEXT_TYPES) | {W_PNG, W_JPEG, W_HTML, W_URI}
+X_SUPPORTED = {X_UTF8, X_STRING, X_TEXT, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
 
 # Recycle each watcher child every N seconds. A helper can wedge (stay alive but
 # stop delivering events), which would otherwise stall sync until the whole
 # service is restarted; bounding its lifetime makes it self-heal. Env-overridable
 # for tuning and tests.
-WATCH_RECYCLE_SECONDS = float(os.environ.get("WATCH_RECYCLE_SECONDS", "300"))
+WATCH_RECYCLE_SECONDS = float(os.environ.get("WATCH_RECYCLE_SECONDS", "3600"))
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
 # `delay`, which doubles up to WATCH_BACKOFF_MAX; a run that lasted at least
 # WATCH_BACKOFF_MAX (e.g. a clean recycle) resets the backoff.
 WATCH_BACKOFF_MIN = 0.2
-WATCH_BACKOFF_MAX = 5.0
+WATCH_BACKOFF_MAX = 30.0
 
 
 def run(cmd: list[str], data: bytes | None = None, timeout: float = 5.0):
@@ -283,7 +292,7 @@ def x_state():
         data = x_read(X_HTML)
         if data:
             return ("html", data, h(data))
-    for target in (X_UTF8, X_PLAIN, X_STRING):
+    for target in (X_UTF8, X_PLAIN, X_STRING, X_TEXT):
         if target in targets:
             data = x_read(target)
             if data:
@@ -316,7 +325,7 @@ def w_state():
         data = wl_read(W_HTML)
         if data:
             return ("html", data, h(data))
-    for text_mime in (W_TEXT, W_TEXT_UTF8):
+    for text_mime in W_TEXT_TYPES:
         if text_mime in types:
             data = wl_read(text_mime)
             if data:
