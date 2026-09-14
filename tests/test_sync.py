@@ -267,5 +267,42 @@ class SyncTest(unittest.TestCase):
             print("\npyclipsync warnings (non-fatal):\n" + "\n".join(warns))
 
 
+class UnreadableOfferLogTest(unittest.TestCase):
+    """Unit tests for the unreadable-offer diagnostic (no live session needed)."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+        pyclipsync._miss_log.clear()
+
+    def test_supported_unreadable_offer_is_logged(self):
+        with self.assertLogs("pyclipsync", level="WARNING") as cm:
+            self.pc._log_unreadable(
+                "Wayland clipboard",
+                {"image/png", "text/plain"},
+                self.pc.W_SUPPORTED,
+            )
+        self.assertIn("image/png", cm.output[0])
+
+    def test_unknown_offers_are_ignored(self):
+        with self.assertNoLogs("pyclipsync", level="WARNING"):
+            self.pc._log_unreadable(
+                "Wayland clipboard", {"application/x-foo"}, self.pc.W_SUPPORTED
+            )
+
+    def test_repeated_identical_offer_is_throttled(self):
+        with self.assertLogs("pyclipsync", level="WARNING"):
+            self.pc._log_unreadable(
+                "Wayland clipboard", {"image/png"}, self.pc.W_SUPPORTED
+            )
+        with self.assertNoLogs("pyclipsync", level="WARNING"):
+            self.pc._log_unreadable(
+                "Wayland clipboard", {"image/png"}, self.pc.W_SUPPORTED
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

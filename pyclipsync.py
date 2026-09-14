@@ -79,6 +79,11 @@ X_TARGETS = {
     "html": X_HTML,
 }
 
+# Types this tool knows how to read. Used only by the diagnostic below, so an
+# unrelated MIME (application/*, primary selection, ...) does not warn.
+W_SUPPORTED = {W_TEXT, W_PNG, W_JPEG, W_HTML, W_URI, "text/plain;charset=utf-8"}
+X_SUPPORTED = {X_UTF8, X_STRING, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
+
 
 def run(cmd: list[str], data: bytes | None = None, timeout: float = 5.0):
     """Run a command. Returns (returncode, stdout). Never raises."""
@@ -198,6 +203,38 @@ def h(data: bytes | None) -> str:
     return hashlib.sha256(data or b"").hexdigest()
 
 
+# Throttle for the unreadable-offer diagnostic: the 1s pollers call the state
+# readers continuously, so log at most once per distinct offer set per window
+# instead of flooding the journal.
+_MISS_LOG_INTERVAL = 30.0
+_miss_log: dict[str, tuple[frozenset[str], float]] = {}
+
+
+def _log_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
+    """Warn (throttled) when a supported type is offered but cannot be read.
+
+    Reading is best-effort: `wl-paste`/`xclip` can return nothing even though
+    the selection advertises a type we handle -- e.g. a client that keeps
+    selection ownership but refuses to serve a background/data-control reader
+    (observed with Chromium on Wayland). Without this the miss is silent: no
+    sync happens and no log line says why.
+    """
+    stuck = offered & supported
+    if not stuck:
+        return
+    now = time.monotonic()
+    prev = _miss_log.get(side)
+    if prev is not None and prev[0] == frozenset(stuck) and now - prev[1] < _MISS_LOG_INTERVAL:
+        return
+    _miss_log[side] = (frozenset(stuck), now)
+    log.warning(
+        "%s: %d supported type(s) offered but unreadable, sync skipped: %s",
+        side,
+        len(stuck),
+        " ".join(sorted(stuck)),
+    )
+
+
 def x_state():
     """Read the X11 CLIPBOARD. Returns (kind, data, digest) or None.
 
@@ -237,6 +274,7 @@ def x_state():
             data = x_read(target)
             if data:
                 return ("text", data, h(data))
+    _log_unreadable("X11 clipboard", targets, X_SUPPORTED)
     return None
 
 
@@ -268,6 +306,7 @@ def w_state():
         data = wl_read(W_TEXT)
         if data:
             return ("text", data, h(data))
+    _log_unreadable("Wayland clipboard", types, W_SUPPORTED)
     return None
 
 
@@ -426,6 +465,7 @@ def watch_wayland(syncer: Syncer, mime: str):
     ) as p:
         assert p.stdout is not None
         for _ in p.stdout:
+            log.debug("watch %s: new offer", mime)
             syncer.on_w_change()
 
 
