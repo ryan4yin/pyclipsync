@@ -12,7 +12,15 @@ python3Packages.buildPythonApplication {
 
   # single script, no third-party python deps
   format = "other";
-  doCheck = false;
+  doCheck = true;
+
+  # The unit tests need no graphical session; the integration class in
+  # tests/test_sync.py skips itself without DISPLAY/WAYLAND_DISPLAY.
+  checkPhase = ''
+    runHook preCheck
+    ${python3Packages.python.interpreter} -m unittest discover -v -s tests
+    runHook postCheck
+  '';
 
   installPhase = ''
     mkdir -p $out/bin
