@@ -52,6 +52,8 @@ from typing import NamedTuple
 log = logging.getLogger("pyclipsync")
 
 
+# ---- Configuration -----------------------------------------------------------
+
 def _env_seconds(name: str, default: float) -> float:
     """Read a positive float from the environment, falling back to `default`."""
     raw = os.environ.get(name)
@@ -139,6 +141,8 @@ IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 # WATCH_BACKOFF_MAX (e.g. a clean recycle) resets the backoff.
 WATCH_BACKOFF_MIN = 0.2
 WATCH_BACKOFF_MAX = 30.0
+
+# ---- Helper processes & clipboard IO -----------------------------------------
 
 def run(cmd: list[str], data: bytes | None = None, timeout: float = CLIPBOARD_TIMEOUT):
     """Run a command. Returns (returncode, stdout). Never raises."""
@@ -337,6 +341,8 @@ def x_set(target: str, data: bytes) -> bool:
     return _procs.spawn_owner(["xclip", "-selection", "clipboard", "-t", target], data)
 
 
+# ---- Content model -----------------------------------------------------------
+
 def normalize_uri(data: bytes) -> bytes:
     """Normalize an uri-list / gnome-copied-files payload.
 
@@ -412,6 +418,8 @@ W_PRIORITY = (
 X_SUPPORTED = {t for p in X_PRIORITY for t in p.types}
 W_SUPPORTED = {t for p in W_PRIORITY for t in p.types}
 
+
+# ---- Read & push -------------------------------------------------------------
 
 def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
     """Warn when a supported type is offered but cannot be read.
@@ -512,6 +520,8 @@ def _destination_after_push(state, readback):
     return readback() or state
 
 
+# ---- Syncer ------------------------------------------------------------------
+
 class Syncer:
     def __init__(self):
         self.lock = threading.Lock()
@@ -557,6 +567,8 @@ class Syncer:
                 self.last_w = state
                 self.last_x = _destination_after_push(state, x_state)
 
+
+# ---- Watchers ----------------------------------------------------------------
 
 def _watch_loop(run_once, name: str) -> None:
     """Run run_once() forever, backing off only when it reports a failure.
@@ -691,6 +703,8 @@ def watch_poll(syncer: Syncer, interval: float = IDLE_POLL_SECONDS):
             log.exception("fallback poll failed")
         time.sleep(interval)
 
+
+# ---- Entry point -------------------------------------------------------------
 
 _shutdown = threading.Event()
 
