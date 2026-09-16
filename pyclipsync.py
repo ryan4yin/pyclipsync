@@ -76,6 +76,7 @@ X_HTML = "text/html"
 X_UTF8 = "UTF8_STRING"
 X_STRING = "STRING"
 X_PLAIN = "text/plain"
+X_TEXT_TYPES = (X_UTF8, X_PLAIN, X_STRING)
 
 # Wayland mime types. Text is offered as either text/plain or the
 # charset-qualified form (Qt, GTK and Chromium all use the latter), so read both
@@ -115,7 +116,7 @@ _BYTE_EXACT_KINDS = frozenset({"png", "jpeg"})
 # Types this tool knows how to read. Used only by the diagnostic below, so an
 # unrelated MIME (application/*, primary selection, ...) does not warn.
 W_SUPPORTED = set(W_TEXT_TYPES) | {W_PNG, W_JPEG, W_HTML, W_URI}
-X_SUPPORTED = {X_UTF8, X_STRING, X_PLAIN, X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
+X_SUPPORTED = set(X_TEXT_TYPES) | {X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
 
 # Recycle each watcher child every N seconds. A helper can wedge (stay alive but
 # stop delivering events), which would otherwise stall sync until the whole
@@ -140,19 +141,6 @@ IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 # WATCH_BACKOFF_MAX (e.g. a clean recycle) resets the backoff.
 WATCH_BACKOFF_MIN = 0.2
 WATCH_BACKOFF_MAX = 30.0
-
-# Clipboard owners we spawned. wl-copy/xclip fork a child that keeps serving the
-# selection; that child outlives us, so track its process group and kill it on
-# shutdown instead of leaving a stale owner behind after a restart.
-_owner_pgids: set[int] = set()
-_owner_lock = threading.Lock()
-
-# Watcher children (wl-paste --watch, clipnotify). They are also reparented and
-# would keep running if we exit, so terminate them on shutdown too. (Under
-# systemd the cgroup kill covers this, but not when run by hand.)
-_watcher_procs: set[subprocess.Popen] = set()
-_watcher_lock = threading.Lock()
-
 
 def run(cmd: list[str], data: bytes | None = None, timeout: float = CLIPBOARD_TIMEOUT):
     """Run a command. Returns (returncode, stdout). Never raises."""
@@ -182,127 +170,151 @@ def wl_read(mime: str) -> bytes | None:
     return None
 
 
-def _kill_group(pgid: int, sig: int) -> None:
-    """Signal a process group we created, ignoring an already-gone group."""
-    try:
-        os.killpg(pgid, sig)
-    except OSError:
-        pass
+class _ProcPool:
+    """Track the helper processes we spawn and reap them at shutdown.
 
-
-def _group_alive(pgid: int) -> bool:
-    """True if a process group with this id still exists."""
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _prune_owners() -> None:
-    """Forget owner groups that no longer exist.
-
-    A recorded pgid can be recycled by the kernel once its owner exits, so
-    keeping dead entries around risks signalling an unrelated group later.
+    Both kinds are reparented and would outlive us if we exited:
+      owners   -- wl-copy/xclip fork a child that keeps serving the selection.
+                  It is started in its own session, so remember the process
+                  group and kill the whole group.
+      watchers -- wl-paste --watch / clipnotify children we read events from;
+                  terminate them directly.
     """
-    with _owner_lock:
-        dead = [pgid for pgid in _owner_pgids if not _group_alive(pgid)]
-        for pgid in dead:
-            _owner_pgids.discard(pgid)
 
+    def __init__(self):
+        self._owners: set[int] = set()
+        self._owner_lock = threading.Lock()
+        self._watchers: set[subprocess.Popen] = set()
+        self._watcher_lock = threading.Lock()
 
-def _register_watcher(p: subprocess.Popen) -> None:
-    with _watcher_lock:
-        _watcher_procs.add(p)
+    # -- process helpers -----------------------------------------------------
 
-
-def _unregister_watcher(p: subprocess.Popen) -> None:
-    with _watcher_lock:
-        _watcher_procs.discard(p)
-
-
-def _terminate_proc(p: subprocess.Popen) -> None:
-    """Terminate a child, escalating to SIGKILL; never raises."""
-    try:
-        p.terminate()
-    except OSError:
-        return
-    try:
-        p.wait(timeout=2)
-    except subprocess.TimeoutExpired:
+    @staticmethod
+    def terminate(p: subprocess.Popen) -> None:
+        """Terminate a child, escalating to SIGKILL; never raises."""
         try:
-            p.kill()
+            p.terminate()
+        except OSError:
+            return
+        try:
             p.wait(timeout=2)
-        except (subprocess.TimeoutExpired, OSError):
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+                p.wait(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        except OSError:
             pass
-    except OSError:
-        pass
+
+    @staticmethod
+    def _kill_group(pgid: int, sig: int) -> None:
+        """Signal a process group we created, ignoring an already-gone group."""
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _group_alive(pgid: int) -> bool:
+        """True if a process group with this id still exists."""
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    # -- clipboard owners ----------------------------------------------------
+
+    def spawn_owner(self, cmd: list[str], data: bytes) -> bool:
+        """Run a clipboard-owner command and remember its process group.
+
+        wl-copy and xclip fork a child that keeps serving the selection after
+        the parent exits; that child outlives us and would keep owning the
+        clipboard with stale data. Running it in its own session lets
+        cleanup_owners() kill the whole group on shutdown.
+        """
+        try:
+            p = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as e:
+            log.debug("%s failed: %s", cmd[0], e)
+            return False
+        try:
+            p.communicate(input=data, timeout=CLIPBOARD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # Kill the whole group: the direct child may already have forked the
+            # owner child that holds the selection.
+            self._kill_group(p.pid, signal.SIGKILL)
+            p.kill()
+            p.communicate()
+            log.warning("%s did not return within %ss", cmd[0], CLIPBOARD_TIMEOUT)
+            return False
+        if p.returncode != 0:
+            log.debug("%s exited with %s", cmd[0], p.returncode)
+            return False
+        self._prune_owners()
+        with self._owner_lock:
+            self._owners.add(p.pid)
+        return True
+
+    def _prune_owners(self) -> None:
+        """Forget owner groups that no longer exist.
+
+        A recorded pgid can be recycled by the kernel once its owner exits, so
+        keeping dead entries around risks signalling an unrelated group later.
+        """
+        with self._owner_lock:
+            dead = [pgid for pgid in self._owners if not self._group_alive(pgid)]
+            for pgid in dead:
+                self._owners.discard(pgid)
+
+    def cleanup_owners(self) -> None:
+        """Kill the clipboard-owner process groups we spawned (best effort)."""
+        with self._owner_lock:
+            pgids = list(self._owners)
+            self._owners.clear()
+        for pgid in pgids:
+            if self._group_alive(pgid):
+                self._kill_group(pgid, signal.SIGTERM)
+
+    # -- watchers ------------------------------------------------------------
+
+    def register_watcher(self, p: subprocess.Popen) -> None:
+        with self._watcher_lock:
+            self._watchers.add(p)
+
+    def unregister_watcher(self, p: subprocess.Popen) -> None:
+        with self._watcher_lock:
+            self._watchers.discard(p)
+
+    def cleanup_watchers(self) -> None:
+        """Terminate the watcher children we spawned (best effort).
+
+        Under systemd the cgroup kill covers this, but not when run by hand.
+        """
+        with self._watcher_lock:
+            procs = list(self._watchers)
+            self._watchers.clear()
+        for p in procs:
+            self.terminate(p)
 
 
-def _cleanup_watchers() -> None:
-    """Terminate the watcher children we spawned (best effort)."""
-    with _watcher_lock:
-        procs = list(_watcher_procs)
-        _watcher_procs.clear()
-    for p in procs:
-        _terminate_proc(p)
-
-
-def _spawn_owner(cmd: list[str], data: bytes) -> bool:
-    """Run a clipboard-owner command and remember its process group.
-
-    wl-copy and xclip fork a child that keeps serving the selection after the
-    parent exits; that child outlives us and would keep owning the clipboard
-    with stale data. Running it in its own session lets _cleanup_owners kill the
-    whole group on shutdown.
-    """
-    try:
-        p = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError as e:
-        log.debug("%s failed: %s", cmd[0], e)
-        return False
-    try:
-        p.communicate(input=data, timeout=CLIPBOARD_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        # Kill the whole group: the direct child may already have forked the
-        # owner child that holds the selection.
-        _kill_group(p.pid, signal.SIGKILL)
-        p.kill()
-        p.communicate()
-        log.warning("%s did not return within %ss", cmd[0], CLIPBOARD_TIMEOUT)
-        return False
-    if p.returncode != 0:
-        log.debug("%s exited with %s", cmd[0], p.returncode)
-        return False
-    _prune_owners()
-    with _owner_lock:
-        _owner_pgids.add(p.pid)
-    return True
-
-
-def _cleanup_owners() -> None:
-    """Kill the clipboard-owner process groups we spawned (best effort)."""
-    with _owner_lock:
-        pgids = list(_owner_pgids)
-        _owner_pgids.clear()
-    for pgid in pgids:
-        if _group_alive(pgid):
-            _kill_group(pgid, signal.SIGTERM)
+_procs = _ProcPool()
 
 
 def wl_copy(mime: str, data: bytes) -> bool:
     """Write the Wayland clipboard.
 
     wl-copy forks a background child that holds the selection; it inherits
-    stdout/stderr, so those go to /dev/null (see _spawn_owner).
+    stdout/stderr, so those go to /dev/null (see _ProcPool.spawn_owner).
 
     wl-copy also appends exactly one trailing newline to piped text/* input.
     To keep the Wayland clipboard clean (a single trailing newline, no empty
@@ -311,7 +323,7 @@ def wl_copy(mime: str, data: bytes) -> bool:
     """
     if mime.startswith("text/") and data.endswith(b"\n"):
         data = data[:-1]
-    return _spawn_owner(["wl-copy", "--type", mime], data)
+    return _procs.spawn_owner(["wl-copy", "--type", mime], data)
 
 
 def x_targets() -> set[str]:
@@ -332,11 +344,11 @@ def x_set(target: str, data: bytes) -> bool:
     """Write the X CLIPBOARD.
 
     xclip forks a background child that holds the selection and answers
-    SelectionRequests; see _spawn_owner. stdout/stderr go to /dev/null so the
-    call returns as soon as the parent forks (using pipes would block until the
-    owner child exits).
+    SelectionRequests; see _ProcPool.spawn_owner. stdout/stderr go to
+    /dev/null so the call returns as soon as the parent forks (using pipes
+    would block until the owner child exits).
     """
-    return _spawn_owner(["xclip", "-selection", "clipboard", "-t", target], data)
+    return _procs.spawn_owner(["xclip", "-selection", "clipboard", "-t", target], data)
 
 
 def normalize_uri(data: bytes) -> bytes:
@@ -437,7 +449,7 @@ def x_state():
         data = x_read(X_HTML)
         if data:
             return ("html", data, h(data))
-    for target in (X_UTF8, X_PLAIN, X_STRING):
+    for target in X_TEXT_TYPES:
         if target in targets:
             data = x_read(target)
             if data:
@@ -609,16 +621,16 @@ def watch_clipnotify(syncer: Syncer):
         p = subprocess.Popen(
             [clipnotify], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        _register_watcher(p)
+        _procs.register_watcher(p)
         try:
             p.wait(timeout=WATCH_RECYCLE_SECONDS)
         except subprocess.TimeoutExpired:
             # No X selection change for a whole interval: just recycle.
             return True
         finally:
-            _unregister_watcher(p)
+            _procs.unregister_watcher(p)
             if p.poll() is None:
-                _terminate_proc(p)
+                _procs.terminate(p)
         if p.returncode != 0:
             log.warning("clipnotify exited with status %s", p.returncode)
             return False
@@ -643,7 +655,7 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> bool:
         p.terminate()
 
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
-        _register_watcher(p)
+        _procs.register_watcher(p)
         recycler = threading.Timer(recycle, recycle_child)
         recycler.daemon = True
         recycler.start()
@@ -652,10 +664,10 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> bool:
             for _ in p.stdout:
                 on_event()
         finally:
-            _unregister_watcher(p)
+            _procs.unregister_watcher(p)
             recycler.cancel()
             if p.poll() is None:
-                _terminate_proc(p)
+                _procs.terminate(p)
     return recycled.is_set()
 
 
@@ -738,8 +750,8 @@ def main():
         os.environ.get("WAYLAND_DISPLAY"),
     )
     _shutdown.wait()
-    _cleanup_watchers()
-    _cleanup_owners()
+    _procs.cleanup_watchers()
+    _procs.cleanup_owners()
 
 
 if __name__ == "__main__":
