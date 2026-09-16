@@ -319,8 +319,11 @@ class WatchRecycleTest(unittest.TestCase):
     def test_recycles_a_hung_command(self):
         events = []
         start = time.monotonic()
-        self.pc._watch_once(
-            ["sh", "-c", "echo tick; exec sleep 30"], lambda: events.append(1), 0.3
+        # A recycle is a healthy run: it must report success (no backoff).
+        self.assertTrue(
+            self.pc._watch_once(
+                ["sh", "-c", "echo tick; exec sleep 30"], lambda: events.append(1), 0.3
+            )
         )
         self.assertEqual(events, [1])
         self.assertLess(time.monotonic() - start, 5.0)
@@ -328,7 +331,10 @@ class WatchRecycleTest(unittest.TestCase):
     def test_returns_when_command_exits(self):
         events = []
         start = time.monotonic()
-        self.pc._watch_once(["sh", "-c", "echo once"], lambda: events.append(1), 30)
+        # The child died on its own: report failure so the caller backs off.
+        self.assertFalse(
+            self.pc._watch_once(["sh", "-c", "echo once"], lambda: events.append(1), 30)
+        )
         self.assertEqual(events, [1])
         self.assertLess(time.monotonic() - start, 5.0)
 

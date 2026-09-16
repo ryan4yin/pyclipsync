@@ -564,20 +564,25 @@ class Syncer:
 
 
 def _watch_loop(run_once, name: str) -> None:
-    """Run run_once() forever, surviving failures with capped backoff.
+    """Run run_once() forever, backing off only when it reports a failure.
 
-    A watcher must never die silently (that would stall its direction until a
-    service restart) and must not hot-loop when the helper fails immediately.
+    run_once() returns True after a healthy run (an event was handled, or the
+    helper was recycled on schedule) and False when it failed. Only failures
+    back off, so a one-shot helper that legitimately exits after every event
+    (clipnotify) is relaunched immediately instead of being throttled as if it
+    kept failing. A watcher must never die silently either, so a failure is
+    retried with capped backoff rather than escaping the loop.
     """
     delay = WATCH_BACKOFF_MIN
-    while True:
-        started = time.monotonic()
+    while not _shutdown.is_set():
         try:
-            run_once()
+            healthy = run_once()
         except Exception:  # noqa: BLE001 - a watcher must never die
             log.exception("%s failed", name)
-        if time.monotonic() - started >= WATCH_BACKOFF_MAX:
+            healthy = False
+        if healthy:
             delay = WATCH_BACKOFF_MIN
+            continue
         time.sleep(delay)
         delay = min(delay * 2, WATCH_BACKOFF_MAX)
 
@@ -598,7 +603,7 @@ def watch_clipnotify(syncer: Syncer):
         log.error("clipnotify not found in PATH; X -> W sync disabled")
         return
 
-    def once() -> None:
+    def once() -> bool:
         p = subprocess.Popen(
             [clipnotify], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
@@ -607,27 +612,37 @@ def watch_clipnotify(syncer: Syncer):
             p.wait(timeout=WATCH_RECYCLE_SECONDS)
         except subprocess.TimeoutExpired:
             # No X selection change for a whole interval: just recycle.
-            return
+            return True
         finally:
             _unregister_watcher(p)
             if p.poll() is None:
                 _terminate_proc(p)
+        if p.returncode != 0:
+            log.warning("clipnotify exited with status %s", p.returncode)
+            return False
         syncer.on_x_change()
+        return True
 
     _watch_loop(once, "clipnotify")
 
 
-def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
+def _watch_once(cmd: list[str], on_event, recycle: float) -> bool:
     """Run `cmd`, call on_event() per stdout line, then recycle the child.
 
-    Returns when the command exits on its own or after `recycle` seconds, so
-    the caller can restart it. Bounding a watcher's lifetime is what lets the
-    daemon recover from a wedged helper without detecting the wedge: a fresh
-    child is spawned on every call.
+    Returns True when the child was recycled on schedule, False when it exited
+    on its own first (a failed helper) so the caller can back off. Bounding a
+    watcher's lifetime is what lets the daemon recover from a wedged helper
+    without detecting the wedge: a fresh child is spawned on every call.
     """
+    recycled = threading.Event()
+
+    def recycle_child() -> None:
+        recycled.set()
+        p.terminate()
+
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
         _register_watcher(p)
-        recycler = threading.Timer(recycle, p.terminate)
+        recycler = threading.Timer(recycle, recycle_child)
         recycler.daemon = True
         recycler.start()
         try:
@@ -639,6 +654,7 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
             recycler.cancel()
             if p.poll() is None:
                 _terminate_proc(p)
+    return recycled.is_set()
 
 
 def watch_wayland(syncer: Syncer):
