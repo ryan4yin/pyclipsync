@@ -127,7 +127,7 @@ WATCH_RECYCLE_SECONDS = _env_seconds("WATCH_RECYCLE_SECONDS", 3600.0)
 # Timeout for a single clipboard helper call. The syncer lock is held across
 # these calls, so a hung helper stalls both directions; keep it short so the
 # stall is bounded (a read that times out also trips the unreadable-offer log).
-CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT", 3.0)
+CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT_SECONDS", 3.0)
 
 # Backstop interval. The watchers are the primary trigger and fire on every
 # change, so this poll only exists to recover the rare event they miss (a
@@ -654,7 +654,7 @@ def watch_clipnotify(syncer: Syncer):
     _watch_loop(once, "clipnotify")
 
 
-def _watch_once(cmd: list[str], on_event, recycle: float) -> bool:
+def _watch_once(cmd: list[str], on_event, recycle_seconds: float) -> bool:
     """Run `cmd`, call on_event() per stdout line, then recycle the child.
 
     Returns True when the child was recycled on schedule, False when it exited
@@ -670,7 +670,7 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> bool:
 
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
         _procs.register_watcher(p)
-        recycler = threading.Timer(recycle, recycle_child)
+        recycler = threading.Timer(recycle_seconds, recycle_child)
         recycler.daemon = True
         recycler.start()
         try:
