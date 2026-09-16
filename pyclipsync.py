@@ -135,6 +135,12 @@ CLIPBOARD_TIMEOUT = _env_seconds("CLIPBOARD_TIMEOUT", 3.0)
 # idle session does not read the whole clipboard every few seconds.
 IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 
+# A clipboard owner can be briefly unresponsive right after a copy (observed
+# with WeChat on X11), so one empty read of an offered type is not conclusive.
+# Retry a couple of times before reporting the offer unreadable.
+READ_RETRIES = 2
+READ_RETRY_DELAY = 0.15
+
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
 # `delay`, which doubles up to WATCH_BACKOFF_MAX; a run that lasted at least
@@ -464,11 +470,31 @@ def _read_state(offered, read, priority):
     return None
 
 
+def _read_state_with_retry(offered, read, priority, supported):
+    """`_read_state` with a couple of quick retries while a supported type is
+    offered but comes back empty.
+
+    An owner that just took the selection may not answer a background reader
+    for a moment, so a single empty read is not conclusive; retrying shortly
+    after usually succeeds. Only retries when a supported type was offered, so
+    an empty clipboard or unrelated MIME costs nothing.
+    """
+    state = _read_state(offered, read, priority)
+    if state is not None or not (offered & supported):
+        return state
+    for _ in range(READ_RETRIES):
+        time.sleep(READ_RETRY_DELAY)
+        state = _read_state(offered, read, priority)
+        if state is not None:
+            return state
+    return None
+
+
 def x_state():
     """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
     targets = x_targets()
     log.debug("read X: %d targets", len(targets))
-    state = _read_state(targets, x_read, X_PRIORITY)
+    state = _read_state_with_retry(targets, x_read, X_PRIORITY, X_SUPPORTED)
     if state is None:
         _warn_unreadable(X_LABEL, targets, X_SUPPORTED)
     return state
@@ -478,7 +504,7 @@ def w_state():
     """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
     types = wl_types()
     log.debug("read W: %d types", len(types))
-    state = _read_state(types, wl_read, W_PRIORITY)
+    state = _read_state_with_retry(types, wl_read, W_PRIORITY, W_SUPPORTED)
     if state is None:
         _warn_unreadable(W_LABEL, types, W_SUPPORTED)
     return state

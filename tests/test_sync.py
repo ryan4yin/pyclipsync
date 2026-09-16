@@ -400,6 +400,56 @@ class UnreadableOfferTest(PyclipsyncTest):
             )
 
 
+class ReadRetryTest(PyclipsyncTest):
+    """A supported offer that reads empty is retried before giving up."""
+
+    def priority(self):
+        return (self.pc._Priority("text", ("UTF8_STRING",)),)
+
+    def test_retries_then_succeeds(self):
+        seen = []
+
+        def read(mime):
+            seen.append(mime)
+            return None if len(seen) < 2 else b"hello"
+
+        with patch.object(self.pc.time, "sleep"):
+            state = self.pc._read_state_with_retry(
+                {"UTF8_STRING"}, read, self.priority(), {"UTF8_STRING"}
+            )
+        self.assertIsNotNone(state)
+        self.assertEqual(state.data, b"hello")
+
+    def test_gives_up_after_the_retry_budget(self):
+        seen = []
+
+        def read(mime):
+            seen.append(mime)
+            return None
+
+        with patch.object(self.pc.time, "sleep"):
+            state = self.pc._read_state_with_retry(
+                {"UTF8_STRING"}, read, self.priority(), {"UTF8_STRING"}
+            )
+        self.assertIsNone(state)
+        self.assertEqual(len(seen), 1 + self.pc.READ_RETRIES)
+
+    def test_no_retry_for_unsupported_offers(self):
+        seen = []
+
+        def read(mime):
+            seen.append(mime)
+            return None
+
+        with patch.object(self.pc.time, "sleep") as sleep:
+            state = self.pc._read_state_with_retry(
+                {"application/x-foo"}, read, self.priority(), {"UTF8_STRING"}
+            )
+        self.assertIsNone(state)
+        self.assertEqual(seen, [])
+        sleep.assert_not_called()
+
+
 class WatchRecycleTest(PyclipsyncTest):
     """Unit tests for the watcher recycle helper (no live session needed)."""
 
