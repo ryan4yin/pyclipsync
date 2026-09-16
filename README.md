@@ -40,13 +40,18 @@ tool [clipsync](https://github.com/123hi123/clipsync):
 Content types, highest priority wins (mapping follows
 [linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)):
 
+- **`image/png`**, **`image/jpeg`** — same mime on both sides
 - **file/image links** — X11: `x-special/gnome-copied-files` (QQ stickers,
   GNOME file copy) or `text/uri-list` (WeChat/QQ images); Wayland:
   `text/uri-list`. Normalized before sync: the `copy` action header is
   stripped and bare absolute paths are rewritten to `file://` URIs
-- **`image/png`**, **`image/jpeg`** — same mime on both sides
 - **`text/html`** — QQ rich text, same mime on both sides
 - **text** — X11: `UTF8_STRING`; Wayland: `text/plain` or `text/plain;charset=utf-8`
+
+Image bytes outrank a file URI when a client offers both (QQ and Chromium put
+`image/png` next to a `file://` URI for a cache/temp file). The bytes paste
+anywhere, while the URI may point into the sender's sandbox namespace, which a
+sandboxed receiver (e.g. Telegram) resolves to a non-existent, empty file.
 
 ## Why pyclipsync
 
@@ -144,8 +149,9 @@ skips when `DISPLAY` / `WAYLAND_DISPLAY` / the helper tools are missing; on
 failure the workdir is kept and the daemon log tail is printed.
 
 The same file also holds unit tests for the internals (unreadable-offer
-diagnostic, watcher recycle/backoff, the syncer state machine, owner/watcher
-cleanup). They need no graphical session, so only the integration class skips
+diagnostic, watcher recycle/backoff, the syncer state machine, image-over-URI
+priority, owner/watcher cleanup). They need no graphical session, so only the
+integration class skips
 on a headless machine. `nix build` runs them via the package's `checkPhase`,
 and CI runs them on every push.
 

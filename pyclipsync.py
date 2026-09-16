@@ -16,15 +16,20 @@ https://github.com/123hi123/clipsync):
 
 A per-side "last synced" state machine prevents X -> W -> X loops.
 
-Content types, highest priority wins (matching linuxqq-clipsync for the
-WeChat/QQ cases):
+Content types, highest priority wins:
+  - png   image/png
+  - jpeg  image/jpeg
   - uri   x-special/gnome-copied-files (GNOME file copy, QQ stickers) or
           text/uri-list (WeChat images)  -> normalized to file:// URIs,
           carried as text/uri-list on both sides
-  - png   image/png
-  - jpeg  image/jpeg
   - html  text/html   (QQ rich text)
   - text  UTF8_STRING / text/plain / STRING
+
+Image bytes outrank a file URI when a client offers both (QQ and Chromium
+put image/png next to a file:// URI for a cache/temp file). The bytes paste
+anywhere, while the URI may point somewhere the receiver cannot read --
+most notably a path inside the sender's sandbox namespace, which a
+sandboxed receiver (e.g. Telegram) resolves to a non-existent, empty file.
 
 Dependencies: python3 (stdlib only), xclip, clipnotify, wl-clipboard.
 """
@@ -389,25 +394,20 @@ def _log_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
 def x_state():
     """Read the X11 CLIPBOARD. Returns (kind, data, digest) or None.
 
-    Priority (highest first), matching linuxqq-clipsync:
-      uri  x-special/gnome-copied-files  (GNOME file copy, QQ stickers)
-      uri  text/uri-list                 (WeChat images, generic file list)
+    Priority (highest first):
       png  image/png
       jpeg image/jpeg
+      uri  x-special/gnome-copied-files  (GNOME file copy, QQ stickers)
+      uri  text/uri-list                 (WeChat images, generic file list)
       html text/html                     (QQ rich text)
       text UTF8_STRING / text/plain / STRING
+
+    Image bytes outrank a file URI when both are offered; see the module
+    docstring for why.
     """
     targets = x_targets()
     if not targets or targets == {"TARGETS"}:
         return None
-    if X_GNOME_FILES in targets:
-        data = normalize_uri(x_read(X_GNOME_FILES) or b"")
-        if data:
-            return ("uri", data, h(data))
-    if X_URI in targets:
-        data = normalize_uri(x_read(X_URI) or b"")
-        if data:
-            return ("uri", data, h(data))
     if X_PNG in targets:
         data = x_read(X_PNG)
         if data:
@@ -416,6 +416,14 @@ def x_state():
         data = x_read(X_JPEG)
         if data:
             return ("jpeg", data, h(data))
+    if X_GNOME_FILES in targets:
+        data = normalize_uri(x_read(X_GNOME_FILES) or b"")
+        if data:
+            return ("uri", data, h(data))
+    if X_URI in targets:
+        data = normalize_uri(x_read(X_URI) or b"")
+        if data:
+            return ("uri", data, h(data))
     if X_HTML in targets:
         data = x_read(X_HTML)
         if data:
@@ -432,15 +440,12 @@ def x_state():
 def w_state():
     """Read the Wayland clipboard. Returns (kind, data, digest) or None.
 
-    Priority: uri-list > png > jpeg > html > text.
+    Priority: png > jpeg > uri-list > html > text. Image bytes outrank a
+    file URI when both are offered; see the module docstring for why.
     """
     types = wl_types()
     if not types:
         return None
-    if W_URI in types:
-        data = normalize_uri(wl_read(W_URI) or b"")
-        if data:
-            return ("uri", data, h(data))
     if W_PNG in types:
         data = wl_read(W_PNG)
         if data:
@@ -449,6 +454,10 @@ def w_state():
         data = wl_read(W_JPEG)
         if data:
             return ("jpeg", data, h(data))
+    if W_URI in types:
+        data = normalize_uri(wl_read(W_URI) or b"")
+        if data:
+            return ("uri", data, h(data))
     if W_HTML in types:
         data = wl_read(W_HTML)
         if data:
