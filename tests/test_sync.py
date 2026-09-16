@@ -606,68 +606,69 @@ class OwnerLifecycleTest(unittest.TestCase):
         import pyclipsync
 
         self.pc = pyclipsync
-        with pyclipsync._owner_lock:
-            pyclipsync._owner_pgids.clear()
+        self.procs = pyclipsync._procs
+        with self.procs._owner_lock:
+            self.procs._owners.clear()
 
     def tearDown(self) -> None:
-        with self.pc._owner_lock:
-            self.pc._owner_pgids.clear()
+        with self.procs._owner_lock:
+            self.procs._owners.clear()
 
     def test_spawn_owner_records_process_group(self):
-        self.assertTrue(self.pc._spawn_owner(["sh", "-c", "exit 0"], b"data"))
-        with self.pc._owner_lock:
-            self.assertEqual(len(self.pc._owner_pgids), 1)
+        self.assertTrue(self.procs.spawn_owner(["sh", "-c", "exit 0"], b"data"))
+        with self.procs._owner_lock:
+            self.assertEqual(len(self.procs._owners), 1)
 
     def test_spawn_owner_timeout_is_not_recorded(self):
         with patch.object(self.pc, "CLIPBOARD_TIMEOUT", 0.2), patch.object(
             self.pc.log, "warning"
         ):
             self.assertFalse(
-                self.pc._spawn_owner(["sh", "-c", "exec sleep 30"], b"data")
+                self.procs.spawn_owner(["sh", "-c", "exec sleep 30"], b"data")
             )
-        with self.pc._owner_lock:
-            self.assertEqual(self.pc._owner_pgids, set())
+        with self.procs._owner_lock:
+            self.assertEqual(self.procs._owners, set())
 
     def test_group_alive(self):
         with patch.object(self.pc.os, "killpg", side_effect=ProcessLookupError):
-            self.assertFalse(self.pc._group_alive(1))
+            self.assertFalse(self.procs._group_alive(1))
         with patch.object(self.pc.os, "killpg", side_effect=PermissionError):
-            self.assertTrue(self.pc._group_alive(1))
+            self.assertTrue(self.procs._group_alive(1))
         with patch.object(self.pc.os, "killpg"):
-            self.assertTrue(self.pc._group_alive(1))
+            self.assertTrue(self.procs._group_alive(1))
 
     def test_prune_owners_drops_dead_groups(self):
-        with self.pc._owner_lock:
-            self.pc._owner_pgids.update({111, 222})
+        with self.procs._owner_lock:
+            self.procs._owners.update({111, 222})
         with patch.object(
-            self.pc, "_group_alive", side_effect=lambda pgid: pgid == 222
+            self.procs, "_group_alive", side_effect=lambda pgid: pgid == 222
         ):
-            self.pc._prune_owners()
-        with self.pc._owner_lock:
-            self.assertEqual(self.pc._owner_pgids, {222})
+            self.procs._prune_owners()
+        with self.procs._owner_lock:
+            self.assertEqual(self.procs._owners, {222})
 
     def test_cleanup_kills_live_groups(self):
-        with self.pc._owner_lock:
-            self.pc._owner_pgids.update({111111, 222222})
+        with self.procs._owner_lock:
+            self.procs._owners.update({111111, 222222})
         killed = []
-        with patch.object(self.pc, "_group_alive", return_value=True), patch.object(
-            self.pc, "_kill_group", side_effect=lambda pgid, _sig: killed.append(pgid)
+        with patch.object(self.procs, "_group_alive", return_value=True), patch.object(
+            self.procs, "_kill_group", side_effect=lambda pgid, _sig: killed.append(pgid)
         ):
-            self.pc._cleanup_owners()
+            self.procs.cleanup_owners()
         self.assertEqual(sorted(killed), [111111, 222222])
-        with self.pc._owner_lock:
-            self.assertEqual(self.pc._owner_pgids, set())
+        with self.procs._owner_lock:
+            self.assertEqual(self.procs._owners, set())
 
     def test_cleanup_skips_dead_groups(self):
-        with self.pc._owner_lock:
-            self.pc._owner_pgids.update({111111, 222222})
+        with self.procs._owner_lock:
+            self.procs._owners.update({111111, 222222})
         killed = []
         with patch.object(
-            self.pc, "_group_alive", side_effect=lambda pgid: pgid == 222222
+            self.procs, "_group_alive", side_effect=lambda pgid: pgid == 222222
         ), patch.object(
-            self.pc, "_kill_group", side_effect=lambda pgid, _sig: killed.append(pgid)
+            self.procs, "_kill_group", side_effect=lambda pgid, _sig: killed.append(pgid)
         ):
-            self.pc._cleanup_owners()
+            self.procs.cleanup_owners()
         self.assertEqual(killed, [222222])
 
 
@@ -680,12 +681,13 @@ class WatcherLifecycleTest(unittest.TestCase):
         import pyclipsync
 
         self.pc = pyclipsync
-        with pyclipsync._watcher_lock:
-            pyclipsync._watcher_procs.clear()
+        self.procs = pyclipsync._procs
+        with self.procs._watcher_lock:
+            self.procs._watchers.clear()
 
     def tearDown(self) -> None:
-        with self.pc._watcher_lock:
-            self.pc._watcher_procs.clear()
+        with self.procs._watcher_lock:
+            self.procs._watchers.clear()
 
     def test_cleanup_terminates_and_clears(self):
         class FakeProc:
@@ -699,13 +701,13 @@ class WatcherLifecycleTest(unittest.TestCase):
                 return 0
 
         a, b = FakeProc(), FakeProc()
-        with self.pc._watcher_lock:
-            self.pc._watcher_procs.update({a, b})
-        self.pc._cleanup_watchers()
+        with self.procs._watcher_lock:
+            self.procs._watchers.update({a, b})
+        self.procs.cleanup_watchers()
         self.assertTrue(a.terminated)
         self.assertTrue(b.terminated)
-        with self.pc._watcher_lock:
-            self.assertEqual(self.pc._watcher_procs, set())
+        with self.procs._watcher_lock:
+            self.assertEqual(self.procs._watchers, set())
 
 
 class SyncerTest(unittest.TestCase):
