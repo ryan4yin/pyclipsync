@@ -702,6 +702,36 @@ class SyncerTest(unittest.TestCase):
         self.assertEqual(self.syncer.last_w, src)
         self.assertEqual(self.syncer.last_x, src)
 
+    def test_x2w_failed_push_arms_a_retry(self):
+        src = self.state(b"hello")
+        armed = []
+        self.syncer.arm_x = lambda delay=0.0: armed.append(delay)
+        with patch.object(self.pc, "x_state", return_value=src), patch.object(
+            self.pc, "push_x_to_w", return_value=False
+        ):
+            self.syncer.on_x_change()
+        self.assertEqual(armed, [self.pc.PUSH_RETRY_SECONDS])
+
+    def test_w2x_failed_push_arms_a_retry(self):
+        src = self.state(b"hello")
+        armed = []
+        self.syncer.arm_w = lambda delay=0.0: armed.append(delay)
+        with patch.object(self.pc, "w_state", return_value=src), patch.object(
+            self.pc, "push_w_to_x", return_value=False
+        ):
+            self.syncer.on_w_change()
+        self.assertEqual(armed, [self.pc.PUSH_RETRY_SECONDS])
+
+    def test_successful_push_does_not_arm_a_retry(self):
+        src = self.state(b"hello")
+        armed = []
+        self.syncer.arm_x = lambda delay=0.0: armed.append(delay)
+        with patch.object(self.pc, "x_state", return_value=src), patch.object(
+            self.pc, "w_state", return_value=src
+        ), patch.object(self.pc, "push_x_to_w", return_value=True):
+            self.syncer.on_x_change()
+        self.assertEqual(armed, [])
+
 
 class CoalescerTest(unittest.TestCase):
     """The coalescer must collapse an event burst into a single read."""
@@ -743,6 +773,43 @@ class CoalescerTest(unittest.TestCase):
         coalescer.stop()
         coalescer.poke()
         time.sleep(0.5)
+        self.assertEqual(calls, [])
+
+
+class SafetyNetTest(unittest.TestCase):
+    """The safety net reads when armed and otherwise only on its backstop."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_armed_read_runs(self):
+        done = threading.Event()
+        net = self.pc._SafetyNet(done.set)
+        try:
+            net.arm(0)
+            self.assertTrue(done.wait(5), "armed safety read never ran")
+        finally:
+            net.stop()
+
+    def test_backstop_read_runs_without_arming(self):
+        done = threading.Event()
+        with patch.object(self.pc, "IDLE_POLL_SECONDS", 0.1):
+            net = self.pc._SafetyNet(done.set)
+            try:
+                self.assertTrue(done.wait(5), "backstop read never ran")
+            finally:
+                net.stop()
+
+    def test_stop_prevents_reads(self):
+        calls = []
+        net = self.pc._SafetyNet(lambda: calls.append(1))
+        net.stop()
+        net.arm(0)
+        time.sleep(0.3)
         self.assertEqual(calls, [])
 
 

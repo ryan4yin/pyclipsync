@@ -128,9 +128,19 @@ WATCH_RECYCLE_SECONDS = _env_seconds("WATCH_RECYCLE_SECONDS", 3600.0)
 # stall is bounded (a read that times out also trips the unreadable-offer log).
 CLIPBOARD_TIMEOUT = _env_seconds("CLIPBOARD_TIMEOUT", 3.0)
 
-# Poller interval. Watchers are event-driven; the pollers are only a safety net
-# for missed events, so this can be coarse, which keeps idle CPU low.
-POLL_INTERVAL_SECONDS = _env_seconds("POLL_INTERVAL_SECONDS", 5.0)
+# Fallback-read cadence. The watchers are the primary trigger; the safety nets
+# only read when a watcher (re)started (a registration gap) or a push failed,
+# plus this slow backstop. Keeping the backstop coarse keeps idle wakeups and
+# clipboard reads near zero while nothing is happening.
+IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
+
+# A watcher (re)start opens a brief window before it registers for events; wait
+# this long before the safety read so a change in that window is not missed.
+WATCH_SETTLE_SECONDS = _env_seconds("WATCH_SETTLE_SECONDS", 0.3)
+
+# A failed push has no later event to retry it, so the safety net retries after
+# this delay (which also bounds the retry rate if the failure persists).
+PUSH_RETRY_SECONDS = _env_seconds("PUSH_RETRY_SECONDS", 5.0)
 
 # Watcher events arrive in bursts: one Wayland offer of several mime types fires
 # one wl-paste --watch per type, and our own push re-triggers the watchers, so
@@ -371,8 +381,8 @@ def h(data: bytes | None) -> str:
     return hashlib.sha256(data or b"").hexdigest()
 
 
-# Throttle for the unreadable-offer diagnostic: the pollers call the state
-# readers continuously, so log at most once per distinct offer set per window
+# Throttle for the unreadable-offer diagnostic: the state readers run on every
+# event and safety read, so log at most once per distinct offer set per window
 # instead of flooding the journal.
 _MISS_LOG_INTERVAL = 30.0
 _miss_log: dict[str, tuple[frozenset[str], float]] = {}
@@ -554,6 +564,58 @@ class _Coalescer:
                 log.exception("coalesced change handler failed")
 
 
+class _SafetyNet:
+    """Fallback clipboard reads for when the watchers cannot be trusted.
+
+    The watchers are the primary trigger; a fixed fast poll is only needed for
+    the rare cases where an event is missed: the registration gap when a
+    watcher (re)starts, and a failed push that no later event retries. So read
+    when armed -- after such a restart or failure -- and otherwise only on a
+    slow backstop. That keeps idle wakeups and clipboard reads near zero while
+    nothing is happening, instead of reading the whole clipboard every few
+    seconds.
+    """
+
+    def __init__(self, on_change):
+        self._on_change = on_change
+        self._cv = threading.Condition()
+        self._deadline = None
+        self._stopped = False
+        threading.Thread(target=self._run, daemon=True, name="safety").start()
+
+    def arm(self, delay: float = 0.0) -> None:
+        """Schedule a read `delay` seconds from now (the earliest one wins)."""
+        with self._cv:
+            when = time.monotonic() + delay
+            if self._deadline is None or when < self._deadline:
+                self._deadline = when
+            self._cv.notify_all()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._stopped = True
+            self._cv.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                if self._stopped:
+                    return
+                now = time.monotonic()
+                if self._deadline is None:
+                    # Idle: schedule the backstop from now and remember it, so
+                    # a later wakeup does not keep pushing the deadline out.
+                    self._deadline = now + IDLE_POLL_SECONDS
+                if self._deadline > now:
+                    self._cv.wait(timeout=self._deadline - now)
+                    continue
+                self._deadline = None
+            try:
+                self._on_change()
+            except Exception:  # noqa: BLE001 - the worker must never die
+                log.exception("safety read failed")
+
+
 def _destination_after_push(state, readback):
     """State to record for the side that just received a push.
 
@@ -572,6 +634,11 @@ class Syncer:
         # last state known to be present on each side (digest form)
         self.last_x = None
         self.last_w = None
+        # Retry hooks: a failed push has no later event to trigger a retry, so
+        # the safety net is asked to re-read the source side after a delay.
+        # No-ops by default; main() wires them to the _SafetyNet instances.
+        self.arm_x = lambda delay=0.0: None
+        self.arm_w = lambda delay=0.0: None
 
     def on_x_change(self):
         # The state read, the dedup decision and the push must be one atomic
@@ -579,8 +646,8 @@ class Syncer:
         # stale clipboard, then pass a stale dedup check and push old data,
         # which is what causes X -> W -> X echo ping-pong under rapid copies.
         # Bookkeeping (last_*) is only updated once the push succeeds, so a
-        # failed push is retried on the next event/poll instead of stalling.
-        # See _destination_after_push for how the destination is recorded.
+        # failed push is retried on the next event or safety read instead of
+        # stalling. See _destination_after_push for the destination state.
         with self.lock:
             state = x_state()
             if state is None:
@@ -595,6 +662,8 @@ class Syncer:
             if push_x_to_w(state):
                 self.last_x = state
                 self.last_w = _destination_after_push(state, w_state)
+            else:
+                self.arm_x(PUSH_RETRY_SECONDS)
 
     def on_w_change(self):
         with self.lock:
@@ -610,6 +679,8 @@ class Syncer:
             if push_w_to_x(state):
                 self.last_w = state
                 self.last_x = _destination_after_push(state, x_state)
+            else:
+                self.arm_w(PUSH_RETRY_SECONDS)
 
 
 def _watch_loop(run_once, name: str) -> None:
@@ -631,7 +702,7 @@ def _watch_loop(run_once, name: str) -> None:
         delay = min(delay * 2, WATCH_BACKOFF_MAX)
 
 
-def watch_clipnotify(poke):
+def watch_clipnotify(poke, safety):
     """X -> W: forward each X11 selection owner change.
 
     clipnotify (nixpkgs) is a one-shot trigger by design: it blocks until the
@@ -641,6 +712,9 @@ def watch_clipnotify(poke):
     means "something changed", and we poke the coalescer to re-read the X
     state. PRIMARY (click-selection) changes also trigger it, but the
     digest-based dedup in Syncer.on_x_change filters those out.
+
+    A recycle (no event for a whole interval) restarts clipnotify and so opens
+    a registration gap; ask the safety net for a settling read afterwards.
     """
     clipnotify = shutil.which("clipnotify")
     if clipnotify is None:
@@ -656,6 +730,7 @@ def watch_clipnotify(poke):
             p.wait(timeout=WATCH_RECYCLE_SECONDS)
         except subprocess.TimeoutExpired:
             # No X selection change for a whole interval: just recycle.
+            safety.arm(WATCH_SETTLE_SECONDS)
             return
         finally:
             _unregister_watcher(p)
@@ -664,41 +739,6 @@ def watch_clipnotify(poke):
         poke()
 
     _watch_loop(once, "clipnotify")
-
-
-def watch_x_poll(syncer: Syncer, interval: float = POLL_INTERVAL_SECONDS):
-    """X -> W safety net.
-
-    The clipnotify relaunch loop has a small registration gap (between one
-    clipnotify exiting and the next registering its XFixes subscription) in
-    which an X11 owner change can be missed. If that change is the last one,
-    no further event re-triggers the sync and it stalls. Polling the X state
-    periodically guarantees convergence; on_x_change is digest-deduped so the
-    extra reads are cheap no-ops when nothing changed.
-    """
-    while True:
-        time.sleep(interval)
-        try:
-            syncer.on_x_change()
-        except Exception:  # noqa: BLE001 - never let the poller die
-            log.exception("x poll failed")
-
-
-def watch_w_poll(syncer: Syncer, interval: float = POLL_INTERVAL_SECONDS):
-    """W -> X safety net, symmetric to watch_x_poll.
-
-    wl-paste --watch only fires on *new* offers; if a W -> X push fails
-    (e.g. xclip transiently unavailable) there is no further W event to
-    trigger a retry, so the sync would stall until the user copies again.
-    Polling the Wayland state guarantees convergence; on_w_change is
-    digest-deduped so the extra reads are cheap no-ops when nothing changed.
-    """
-    while True:
-        time.sleep(interval)
-        try:
-            syncer.on_w_change()
-        except Exception:  # noqa: BLE001 - never let the poller die
-            log.exception("w poll failed")
 
 
 def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
@@ -725,7 +765,7 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
                 _terminate_proc(p)
 
 
-def watch_wayland(poke, mime: str):
+def watch_wayland(poke, safety, mime: str):
     """W -> X: forward each Wayland clipboard offer of the given mime type.
 
     wl-paste --watch takes exactly one command (exec'ed as-is, no shell):
@@ -736,8 +776,9 @@ def watch_wayland(poke, mime: str):
     offer carries into a single read.
 
     The watch child is recycled every WATCH_RECYCLE_SECONDS (see _watch_once)
-    so a wedged watcher cannot silently stall W -> X sync; an offer missed in
-    the brief restart gap is caught by watch_w_poll.
+    so a wedged watcher cannot silently stall W -> X sync. An offer missed in
+    the brief restart gap is caught by a settling safety read, armed here on
+    every (re)start.
     """
     cmd = ["wl-paste", "--type", mime, "--watch", "echo"]
 
@@ -745,9 +786,11 @@ def watch_wayland(poke, mime: str):
         log.debug("watch %s: new offer", mime)
         poke()
 
-    _watch_loop(
-        lambda: _watch_once(cmd, on_event, WATCH_RECYCLE_SECONDS), f"watch {mime}"
-    )
+    def once() -> None:
+        safety.arm(WATCH_SETTLE_SECONDS)
+        _watch_once(cmd, on_event, WATCH_RECYCLE_SECONDS)
+
+    _watch_loop(once, f"watch {mime}")
 
 
 _shutdown = threading.Event()
@@ -775,25 +818,25 @@ def main():
     syncer = Syncer()
     x_coalescer = _Coalescer(syncer.on_x_change, EVENT_DEBOUNCE_SECONDS)
     w_coalescer = _Coalescer(syncer.on_w_change, EVENT_DEBOUNCE_SECONDS)
+    x_safety = _SafetyNet(syncer.on_x_change)
+    w_safety = _SafetyNet(syncer.on_w_change)
+    syncer.arm_x = x_safety.arm
+    syncer.arm_w = w_safety.arm
+
+    # Sync whatever is already on either clipboard at startup.
+    x_safety.arm(WATCH_SETTLE_SECONDS)
+    w_safety.arm(WATCH_SETTLE_SECONDS)
+
     threading.Thread(
-        target=watch_clipnotify, args=(x_coalescer.poke,), daemon=True, name="x2w"
-    ).start()
-    threading.Thread(
-        target=watch_x_poll,
-        args=(syncer, POLL_INTERVAL_SECONDS),
+        target=watch_clipnotify,
+        args=(x_coalescer.poke, x_safety),
         daemon=True,
-        name="x2w-poll",
-    ).start()
-    threading.Thread(
-        target=watch_w_poll,
-        args=(syncer, POLL_INTERVAL_SECONDS),
-        daemon=True,
-        name="w2x-poll",
+        name="x2w",
     ).start()
     for mime in W_WATCH_TYPES:
         threading.Thread(
             target=watch_wayland,
-            args=(w_coalescer.poke, mime),
+            args=(w_coalescer.poke, w_safety, mime),
             daemon=True,
             name=f"w2x-{mime}",
         ).start()
@@ -806,6 +849,8 @@ def main():
     _shutdown.wait()
     x_coalescer.stop()
     w_coalescer.stop()
+    x_safety.stop()
+    w_safety.stop()
     _cleanup_watchers()
     _cleanup_owners()
 
