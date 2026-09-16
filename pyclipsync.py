@@ -138,9 +138,12 @@ IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 # A clipboard owner can be briefly unresponsive right after a copy (observed
 # with WeChat on X11), so one empty read of an offered type is not conclusive.
 # Retry a couple of times before reporting the offer unreadable, backing off
-# exponentially (READ_RETRY_DELAY, doubling).
+# exponentially (READ_RETRY_DELAY, doubling). A read that itself took long (an
+# unresponsive owner, up to CLIPBOARD_TIMEOUT) is not retried: multiplying a
+# multi-second stall under the syncer lock would just delay the newest content.
 READ_RETRIES = 2
 READ_RETRY_DELAY = 0.15
+READ_RETRY_MAX_ATTEMPT = 1.0
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
@@ -471,26 +474,30 @@ def _read_state(offered, read, priority):
     return None
 
 
-def _read_state_with_retry(offered, read, priority, supported):
-    """`_read_state` with a couple of quick retries while a supported type is
+def _read_state_with_retry(offered, read, priority):
+    """`_read_state` with a couple of quick retries while a priority type is
     offered but comes back empty.
 
     An owner that just took the selection may not answer a background reader
-    for a moment, so a single empty read is not conclusive; retrying shortly
-    after usually succeeds. Waits READ_RETRY_DELAY, doubling each retry, and
-    only retries when a supported type was offered, so an empty clipboard or
-    unrelated MIME costs nothing.
+    for a moment, so one empty read is not conclusive. Retries only when a
+    priority type was offered (nothing to retry otherwise) and only while each
+    read stays quick: a read that itself took long (READ_RETRY_MAX_ATTEMPT) is
+    a hung owner, not a brief race, and retrying would multiply the stall.
     """
-    state = _read_state(offered, read, priority)
-    if state is not None or not (offered & supported):
-        return state
+    relevant = any(mime in offered for entry in priority for mime in entry.types)
     delay = READ_RETRY_DELAY
-    for _ in range(READ_RETRIES):
-        time.sleep(delay)
+    for attempt in range(READ_RETRIES + 1):
+        if attempt:
+            if not relevant:
+                break
+            time.sleep(delay)
+            delay *= 2
+        started = time.monotonic()
         state = _read_state(offered, read, priority)
         if state is not None:
             return state
-        delay *= 2
+        if time.monotonic() - started > READ_RETRY_MAX_ATTEMPT:
+            break
     return None
 
 
@@ -498,7 +505,7 @@ def x_state():
     """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
     targets = x_targets()
     log.debug("read X: %d targets", len(targets))
-    state = _read_state_with_retry(targets, x_read, X_PRIORITY, X_SUPPORTED)
+    state = _read_state_with_retry(targets, x_read, X_PRIORITY)
     if state is None:
         _warn_unreadable(X_LABEL, targets, X_SUPPORTED)
     return state
@@ -508,7 +515,7 @@ def w_state():
     """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
     types = wl_types()
     log.debug("read W: %d types", len(types))
-    state = _read_state_with_retry(types, wl_read, W_PRIORITY, W_SUPPORTED)
+    state = _read_state_with_retry(types, wl_read, W_PRIORITY)
     if state is None:
         _warn_unreadable(W_LABEL, types, W_SUPPORTED)
     return state
