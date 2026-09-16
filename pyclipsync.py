@@ -5,9 +5,7 @@ For Wayland compositors that run X11 apps through xwayland-satellite
 (niri, Hyprland, ...), where neither the compositor nor the satellite
 bridges the X11 CLIPBOARD selection with the Wayland data device.
 
-The script is a thin orchestrator over battle-tested CLI tools
-(same primitives as the bash tool `clipsync` by 123hi123,
-https://github.com/123hi123/clipsync):
+The script is a thin orchestrator over battle-tested CLI tools:
 
   X11 -> Wayland:     clipnotify exits      -> xclip reads  -> wl-copy
                       (relaunched in a loop, each exit = one selection event)
@@ -47,7 +45,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 log = logging.getLogger("pyclipsync")
 
@@ -79,10 +79,8 @@ X_STRING = "STRING"
 X_PLAIN = "text/plain"
 X_TEXT_TYPES = (X_UTF8, X_PLAIN, X_STRING)
 
-# Wayland mime types. Text is offered as either text/plain or the
-# charset-qualified form (Qt, GTK and Chromium all use the latter), so read both
-# and prefer UTF-8. UTF8_STRING/TEXT/STRING are X11 atom names, not Wayland
-# types; GTK/Qt translate them to text/plain;charset=utf-8 on this side.
+# Wayland mime types. Text comes as text/plain or the charset-qualified form
+# (GTK/Qt/Chromium use the latter); read both, prefer UTF-8.
 W_TEXT = "text/plain"
 W_TEXT_UTF8 = "text/plain;charset=utf-8"
 W_PNG = "image/png"
@@ -91,8 +89,7 @@ W_HTML = "text/html"
 W_URI = "text/uri-list"
 W_TEXT_TYPES = (W_TEXT_UTF8, W_TEXT)
 
-# Human-readable side names, shared by the info logs and the unreadable-offer
-# diagnostic so each string lives in one place.
+# Human-readable side names for logs and diagnostics.
 X_LABEL = "X11 clipboard"
 W_LABEL = "Wayland clipboard"
 
@@ -188,8 +185,6 @@ class _ProcPool:
         self._watchers: set[subprocess.Popen] = set()
         self._watcher_lock = threading.Lock()
 
-    # -- process helpers -----------------------------------------------------
-
     @staticmethod
     def terminate(p: subprocess.Popen) -> None:
         """Terminate a child, escalating to SIGKILL; never raises."""
@@ -226,8 +221,6 @@ class _ProcPool:
         except PermissionError:
             return True
         return True
-
-    # -- clipboard owners ----------------------------------------------------
 
     def spawn_owner(self, cmd: list[str], data: bytes) -> bool:
         """Run a clipboard-owner command and remember its process group.
@@ -286,8 +279,6 @@ class _ProcPool:
             if self._group_alive(pgid):
                 self._kill_group(pgid, signal.SIGTERM)
 
-    # -- watchers ------------------------------------------------------------
-
     def register_watcher(self, p: subprocess.Popen) -> None:
         with self._watcher_lock:
             self._watchers.add(p)
@@ -342,13 +333,7 @@ def x_read(target: str) -> bytes | None:
 
 
 def x_set(target: str, data: bytes) -> bool:
-    """Write the X CLIPBOARD.
-
-    xclip forks a background child that holds the selection and answers
-    SelectionRequests; see _ProcPool.spawn_owner. stdout/stderr go to
-    /dev/null so the call returns as soon as the parent forks (using pipes
-    would block until the owner child exits).
-    """
+    """Write the X CLIPBOARD (xclip forks an owner; see _ProcPool.spawn_owner)."""
     return _procs.spawn_owner(["xclip", "-selection", "clipboard", "-t", target], data)
 
 
@@ -398,30 +383,34 @@ class State:
         return cls(kind, data, digest(data))
 
 
-# Read priority per side: (kind, offered types, optional transform), highest
-# first. `transform` normalizes uri payloads (normalize_uri); images and text
-# pass through unchanged. X has two URI spellings: GNOME file copies and QQ
+class _Priority(NamedTuple):
+    kind: str
+    types: tuple[str, ...]
+    transform: Callable[[bytes], bytes] | None = None
+
+
+# Read priority per side, highest first. `transform` normalizes the payload
+# (only uri needs it). X has two URI spellings: GNOME file copies and QQ
 # stickers use x-special/gnome-copied-files, everyone else text/uri-list.
 X_PRIORITY = (
-    ("png", (X_PNG,), None),
-    ("jpeg", (X_JPEG,), None),
-    ("uri", (X_GNOME_FILES, X_URI), normalize_uri),
-    ("html", (X_HTML,), None),
-    ("text", X_TEXT_TYPES, None),
+    _Priority("png", (X_PNG,)),
+    _Priority("jpeg", (X_JPEG,)),
+    _Priority("uri", (X_GNOME_FILES, X_URI), normalize_uri),
+    _Priority("html", (X_HTML,)),
+    _Priority("text", X_TEXT_TYPES),
 )
 W_PRIORITY = (
-    ("png", (W_PNG,), None),
-    ("jpeg", (W_JPEG,), None),
-    ("uri", (W_URI,), normalize_uri),
-    ("html", (W_HTML,), None),
-    ("text", W_TEXT_TYPES, None),
+    _Priority("png", (W_PNG,)),
+    _Priority("jpeg", (W_JPEG,)),
+    _Priority("uri", (W_URI,), normalize_uri),
+    _Priority("html", (W_HTML,)),
+    _Priority("text", W_TEXT_TYPES),
 )
 
 # Types we can read, derived from the priorities so they cannot drift. Used
-# only by the diagnostic below, so an unrelated MIME (application/*, primary
-# selection, ...) does not warn.
-X_SUPPORTED = {t for _, types, _ in X_PRIORITY for t in types}
-W_SUPPORTED = {t for _, types, _ in W_PRIORITY for t in types}
+# only by the diagnostic below, so an unrelated MIME does not warn.
+X_SUPPORTED = {t for p in X_PRIORITY for t in p.types}
+W_SUPPORTED = {t for p in W_PRIORITY for t in p.types}
 
 
 def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
@@ -448,24 +437,22 @@ def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
 
 
 def _read_state(offered, read, priority):
-    """Return (kind, data, digest) for the highest-priority readable offer.
+    """Return the highest-priority readable State, or None.
 
-    `priority` is a side's (kind, types, transform) table; see X_PRIORITY.
-    Reading is best-effort, so a candidate that cannot be read is skipped and
-    the next one is tried. Pure: the caller owns the side identity and the
-    unreadable-offer diagnostic.
+    Reading is best-effort, so an unreadable candidate is skipped and the next
+    one is tried.
     """
     if not offered or offered == {"TARGETS"}:
         return None
-    for kind, types, transform in priority:
-        for mime in types:
+    for entry in priority:
+        for mime in entry.types:
             if mime not in offered:
                 continue
             data = read(mime)
-            if data and transform is not None:
-                data = transform(data)
+            if data and entry.transform is not None:
+                data = entry.transform(data)
             if data:
-                return State.of(kind, data)
+                return State.of(entry.kind, data)
     return None
 
 

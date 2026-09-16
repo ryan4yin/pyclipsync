@@ -1,118 +1,80 @@
 # pyclipsync
 
-**English** | [中文](./README.zh.md)
+[English](./README.en.md) | **中文**
 
-Wayland <-> X11 clipboard synchronization daemon for Wayland compositors that
-run X11 apps through [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
-(niri, Hyprland, ...).
+给 niri、Hyprland 这类通过 [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite) 跑 X11 应用的 Wayland 合成器用的剪贴板同步守护进程，让 Wayland 原生应用和 X11 应用能正常共享剪贴板。
 
-## The problem
+## 问题
 
-With xwayland-satellite, X11 apps live in a rootless X server that is *outside*
-the compositor. The satellite does bridge the X11 `CLIPBOARD` selection with
-the Wayland data device in both directions, but the bridge is incomplete and
-fragile, so the result is a clipboard that **works sometimes and not others**:
+用 xwayland-satellite 的时候，X11 应用（微信、QQ 这些）跑在合成器外面的一个 rootless X server 里。satellite 其实也做了 X11 `CLIPBOARD` 和 Wayland 剪贴板之间的双向桥接，但做得不完整也不可靠，所以剪贴板**时灵时不灵**：
 
-- X↔Wayland **target/mime translation** drops X-specific targets
-  (`x-special/gnome-copied-files`, `application/x-qt-image`, raw
-  `UTF8_STRING`) that have no Wayland equivalent.
-- X11 selection is **request-based with lazy owners**: the satellite must ask
-  the current owner for the data, and some owners (certain GTK/Qt apps, and
-  apps that exit right after copying) fail to serve it.
-- The satellite's **selection tracking can go stale**, so an X11 app may keep
-  pasting an older copy.
+- X11 和 Wayland 的剪贴板格式（target/mime）并不一一对应，`x-special/gnome-copied-files`、`application/x-qt-image`、裸的 `UTF8_STRING` 这些 X 专有格式没有 Wayland 对应物，直接被丢掉；
+- X11 剪贴板是请求式的：复制的那个应用当 owner，别人粘贴得现场找它要数据。有些应用（某些 GTK/Qt 程序、复制完就退出的程序）这时候给不出来；
+- satellite 对 owner 的跟踪有时会失效，X11 应用就一直粘到旧内容。
 
-In practice even plain text is hit or miss, and images, rich text and file
-copies from WeChat/QQ (`QT_QPA_PLATFORM=xcb`) fail most of the time. This is a
-known gap in the satellite ecosystem
-([xwayland-satellite#50](https://github.com/Supreeeme/xwayland-satellite/issues/50)).
+实际用起来连纯文本都看运气，微信/QQ（`QT_QPA_PLATFORM=xcb`）里复制图片、富文本、文件更是基本必挂。这是 satellite 生态的已知问题（[xwayland-satellite#50](https://github.com/Supreeeme/xwayland-satellite/issues/50)）。
 
-## How it works
+## 原理
 
-A small Python orchestrator over the same battle-tested CLI tools as the bash
-tool [clipsync](https://github.com/123hi123/clipsync):
+本质就是一个 Python 小脚本，调度一套久经考验的 CLI 工具（和 bash 版 [clipsync](https://github.com/123hi123/clipsync) 用的是同一套）：
 
-| direction      | watcher                        | reader     | writer                    |
-| -------------- | ------------------------------ | ---------- | ------------------------- |
-| X11 -> Wayland | `clipnotify` relaunch loop     | `xclip`    | `wl-copy`                 |
-| Wayland -> X11 | `wl-paste --watch` (any offer) | `wl-paste` | `xclip` (CLIPBOARD owner) |
+| 方向          | 怎么发现变化                     | 怎么读     | 怎么写                       |
+| ------------- | -------------------------------- | ---------- | ---------------------------- |
+| X11 → Wayland | `clipnotify`（循环重启）         | `xclip`    | `wl-copy`                    |
+| Wayland → X11 | `wl-paste --watch`（任意 offer） | `wl-paste` | `xclip`（接管 CLIPBOARD）    |
 
-The watchers are the primary trigger and fire on every change. A slow per-side
-backstop poll (default 60s) exists only to recover the rare event they miss (a
-wedged watcher, a restart gap, a failed push), so an idle session does not read
-the whole clipboard every few seconds.
+watcher 是主要触发源，每次变化都会触发。每侧另有一个很慢的兜底轮询（默认 60 秒），只用来兜住 watcher 偶尔漏掉的事件（watcher 卡死、重启空隙、push 失败），所以空闲时不会每几秒就把整个剪贴板读一遍。
 
-Content types, highest priority wins (mapping follows
-[linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)):
+支持的类型，按优先级从高到低（映射参考 [linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)）：
 
-- **`image/png`**, **`image/jpeg`** — same mime on both sides
-- **file/image links** — X11: `x-special/gnome-copied-files` (QQ stickers,
-  GNOME file copy) or `text/uri-list` (WeChat/QQ images); Wayland:
-  `text/uri-list`. Normalized before sync: the `copy` action header is
-  stripped and bare absolute paths are rewritten to `file://` URIs
-- **`text/html`** — QQ rich text, same mime on both sides
-- **text** — X11: `UTF8_STRING`; Wayland: `text/plain` or `text/plain;charset=utf-8`
+- **`image/png`**、**`image/jpeg`** — 两侧同名
+- **文件/图片链接** — X11 侧：`x-special/gnome-copied-files`（QQ 表情、GNOME 文件复制）或 `text/uri-list`（微信/QQ 图片）；Wayland 侧：`text/uri-list`。同步前归一：去掉 `copy` 头，裸路径统一改写成 `file://`
+- **`text/html`** — QQ 富文本，两侧同名
+- **纯文本** — X11 侧 `UTF8_STRING`，Wayland 侧 `text/plain` 或 `text/plain;charset=utf-8`
 
-Image bytes outrank a file URI when a client offers both (QQ and Chromium put
-`image/png` next to a `file://` URI for a cache/temp file). The bytes paste
-anywhere, while the URI may point into the sender's sandbox namespace, which a
-sandboxed receiver (e.g. Telegram) resolves to a non-existent, empty file.
+客户端同时提供图片和文件 URI 时（QQ、Chromium 复制图片会同时放一份 `image/png` 和一个指向缓存/临时文件的 `file://` URI），优先同步图片字节。图片字节到哪都能粘，而 URI 可能指向发送方沙箱命名空间里的路径——接收方若也在沙箱里（比如 Telegram），解析出来就是一个不存在的空文件。
 
-## Why pyclipsync
+## 为什么选 pyclipsync
 
-For satellite setups, the existing options each fall short (the satellite's
-own bridge is covered in [The problem](#the-problem)):
+satellite 场景下现成的方案都有硬伤（satellite 自带的桥接为什么不行，见[问题](#问题)）：
 
-| tool                                                                                   | gap                                                                                                                        |
-| -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| [clipsync](https://github.com/123hi123/clipsync) (two bash daemons)          | no X→W `text/html`; no state or polling — a failed read can wipe the Wayland side, a failed push waits for the next copy |
-| [wl-x11-clipsync](https://github.com/arabianq/wl-x11-clipsync) (single Python script)   | no `gnome-copied-files` / WeChat `x-qt-image`; image→X11 "works really badly"                                              |
-| [qq-wayland-clipboard](https://github.com/w568w/qq-wayland-clipboard) (Rust wrapper + Xvfb) | only for QQ in *native Wayland* mode, not X11 clients                                        |
+| 工具                                                                                     | 问题                                                                                                        |
+| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| [clipsync](https://github.com/123hi123/clipsync)（两个 bash 守护进程）             | X→W 不支持 `text/html`；没有状态、没有轮询——X 侧读失败可能把 Wayland 侧清空，推送失败就得等下一次复制 |
+| [wl-x11-clipsync](https://github.com/arabianq/wl-x11-clipsync)（单个 Python 脚本）   | 不支持 `gnome-copied-files` / 微信 `x-qt-image`；作者自己都说图片→X11 "works really badly"        |
+| [qq-wayland-clipboard](https://github.com/w568w/qq-wayland-clipboard)（Rust wrapper + Xvfb） | 只修原生 Wayland 模式的 QQ，X11 客户端用不上                                   |
 
-pyclipsync adds what they lack:
+pyclipsync 补的洞：
 
-- **`text/html` both ways** (QQ rich text)
-- **a real state machine**: per-side sha256 digest, read + dedup + push
-  atomic under one lock, destination recorded from a readback (skipped for
-  byte-exact images), watchers on every change with a slow backstop poll
-- **no redundant work**: one `wl-paste --watch` covers every offer (no burst
-  of per-mime events), binary (`image/png`/`image/jpeg`) syncs skip the
-  destination readback, and the backstop is one slow poll rather than a fixed
-  fast one — so a large image is not transferred while nothing is happening
-- **no destructive pushes**: empty or unreadable sources are never
-  propagated; unservable targets fall back to the next one
-- **integration-tested end to end** — the bash tools ship no tests: 15
-  cases run the real daemon under a live X11 + Wayland session, every
-  type byte-exact in both directions, plus startup sync and the backstop
-  poll. See [Testing](#testing).
+- `text/html` 双向都同步（QQ 富文本）
+- 真正的状态机：两边各记一份 sha256，读取、判重、推送在同一把锁里一次做完，不会互相打架；目标侧状态以实际读回为准（`wl-copy` 偷偷加换行这种坑不会把判重带偏）；watcher 每次变化都触发，外加一个慢兜底轮询
+- 不做无用功：一个 `wl-paste --watch` 覆盖所有 offer（不会有一串按 mime 触发的事件）；二进制（`image/png`/`image/jpeg`）同步跳过目标侧回读（本来就逐字节一致）；兜底只保留一个低频轮询，而不是原来的固定高频轮询，所以空闲时一张大图不会被反复传输
+- 绝不推垃圾：剪贴板是空的、或者读不出来，就什么都不动；某个 target 读不出来就换下一个试
+- 自带端到端集成测试（bash 工具一个测试都没有）：15 个用例在真实的 X11 + Wayland 会话里跑真实守护进程，每种类型双向逐字节校验，外加启动同步和兜底轮询。详见[测试](#测试)
 
-## Dependencies
+## 依赖
 
-- `python3` (standard library only — no third-party python packages)
+- `python3`（只用标准库，没有第三方 Python 包）
 - [`xclip`](https://github.com/astrand/xclip)
 - [`clipnotify`](https://github.com/cdown/clipnotify)
-- [`wl-clipboard`](https://github.com/bugaevc/wl-clipboard) (`wl-copy`/`wl-paste`)
+- [`wl-clipboard`](https://github.com/bugaevc/wl-clipboard)（`wl-copy`/`wl-paste`）
 
-All are in nixpkgs.
+都在 nixpkgs 里。
 
-## Environment
+## 环境变量
 
-Tunables, read once at startup. Values must be a positive number; an invalid
-one logs a warning and falls back to the default.
+启动时读取一次。值必须是正数，非法值会打一条 warning 并退回默认值。
 
-| variable                | default | meaning                                                                   |
-| ----------------------- | ------- | ------------------------------------------------------------------------- |
-| `DEBUG`                 | unset   | any value enables debug logging (one line per clipboard read, and more)   |
-| `WATCH_RECYCLE_SECONDS` | `3600`  | recycle each watcher child after this long, so a wedged one self-heals    |
-| `CLIPBOARD_TIMEOUT`     | `3`     | timeout for one helper call (the syncer lock is held across it)           |
-| `IDLE_POLL_SECONDS`     | `60`    | backstop poll interval — the recovery bound when a watcher misses an event |
+| 变量                    | 默认值 | 含义                                                         |
+| ----------------------- | ------ | ------------------------------------------------------------ |
+| `DEBUG`                 | 未设置 | 任意值开启 debug 日志（每次读取剪贴板打一行，等等）          |
+| `WATCH_RECYCLE_SECONDS` | `3600` | watcher 子进程多久回收一次，卡死的能自愈                     |
+| `CLIPBOARD_TIMEOUT`     | `3`    | 单次 helper 调用的超时（syncer 锁在此期间持有）              |
+| `IDLE_POLL_SECONDS`     | `60`   | 兜底轮询间隔——漏掉事件时的恢复上限                           |
 
-## Usage
+## 使用
 
-Run it as a systemd user service (unit file:
-[`pyclipsync.service`](./pyclipsync.service)). It needs `DISPLAY` and
-`WAYLAND_DISPLAY` from the graphical session (set by the display manager on
-login):
+用 systemd 用户服务跑（unit 文件见 [`pyclipsync.service`](./pyclipsync.service)）。需要图形会话里的 `DISPLAY` 和 `WAYLAND_DISPLAY`（登录时由 display manager 设好）：
 
 ```sh
 install -Dm755 pyclipsync.py ~/.local/bin/pyclipsync
@@ -121,13 +83,11 @@ systemctl --user enable --now pyclipsync
 journalctl --user -u pyclipsync -f
 ```
 
-For a quick try or debugging, run `pyclipsync` in a terminal; `DEBUG=1`
-turns on debug logging.
+想在前台试跑或调试的话，直接在终端执行 `pyclipsync`；加 `DEBUG=1` 可以开 debug 日志。
 
 ## Nix
 
-The flake exposes a `pyclipsync` package and a home-manager module that
-installs it as a systemd user service:
+flake 提供 `pyclipsync` 包和一个 home-manager module（装好并作为 systemd 用户服务运行）：
 
 ```nix
 # flake.nix
@@ -137,8 +97,7 @@ inputs.pyclipsync = {
 };
 ```
 
-Recommended: let home-manager manage the service (follows the graphical
-session, restarts on failure):
+推荐让 home-manager 管这个服务（跟着图形会话启用，挂了自动重启）：
 
 ```nix
 home-manager.users.<user> = {
@@ -147,60 +106,42 @@ home-manager.users.<user> = {
 };
 ```
 
-Or just take the binary and run it yourself:
+或者只拿二进制自己跑：
 
 ```nix
 home.packages = [ inputs.pyclipsync.packages.${system}.pyclipsync ];
 ```
 
-Without flakes:
+不用 flake：
 
 ```nix
 { flake ? (fetchTarball "github:ryan4yin/pyclipsync") }:
 flake.packages.${builtins.currentSystem}.default
 ```
 
-## Testing
+## 测试
 
-Integration tests live in [`tests/test_sync.py`](./tests/test_sync.py)
-(standard-library `unittest`, no extra dependencies). They start a real daemon
-under a **live X11 (XWayland) + Wayland session** and verify byte-exact sync
-for every supported type in both directions, including the QQ sticker
-(`gnome-copied-files`) case and a rapid double-copy race. A second class starts
-its own daemon per test for the paths the watchers do not drive: the initial
-read at startup, backstop recovery after the `wl-paste` watcher is wedged, and
-an idle window that asserts no reads happen. The whole suite skips when
-`DISPLAY` / `WAYLAND_DISPLAY` / the helper tools are missing; on failure the
-workdir is kept and the daemon log tail is printed.
+集成测试在 [`tests/test_sync.py`](./tests/test_sync.py)，标准库 `unittest`，没有额外依赖。会在真实的 X11 (XWayland) + Wayland 会话里把守护进程跑起来，把每种类型双向同步都按字节校验一遍，包括 QQ 表情（`gnome-copied-files`）和快速连续复制两次的竞态。另有一个测试类每个用例单独起一个守护进程，覆盖 watcher 之外的两条路径：启动时的初始读取、把 `wl-paste` watcher 卡住后由兜底轮询恢复，以及"空闲窗口内不发生任何读取"的断言。没有 `DISPLAY` / `WAYLAND_DISPLAY` / 辅助工具时整套自动跳过；失败了会保留工作目录、打印守护进程日志尾部，方便排查。
 
-The same file also holds unit tests for the internals (unreadable-offer
-diagnostic, watcher recycle/backoff, the syncer state machine, image-over-URI
-priority, binary readback, backstop poll, owner/watcher cleanup). They need no
-graphical session, so only the integration class skips on a headless machine.
-`nix build` runs them via the package's `checkPhase`, and CI runs them on every
-push.
+同一个文件里还有一组单元测试（读不出的 offer 诊断、watcher 重建/退避、状态机、图片优先于 URI 的优先级、二进制回读、兜底轮询、owner/watcher 清理），它们不需要图形会话，无头机器上只有集成类会跳过；`nix build` 会通过 `checkPhase` 跑，CI 每次 push 也会跑。
 
 ```sh
-# test the repo's pyclipsync.py
+# 测仓库里的 pyclipsync.py
 python3 -m unittest discover -v
 
-# test the built binary
+# 测构建出来的二进制
 PYCLIPSYNC=$(nix build .#default --print-out-paths)/bin/pyclipsync \
     python3 -m unittest discover -v
 ```
 
-## Credits
+## 致谢
 
-- Design and WeChat MIME-type handling inspired by
-  [123hi123/clipsync](https://github.com/123hi123/clipsync) (MIT)
-- QQ MIME-type mapping follows
-  [SHORiN-KiWATA/linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync);
-  also consulted [arabianq/wl-x11-clipsync](https://github.com/arabianq/wl-x11-clipsync)
-  and [w568w/qq-wayland-clipboard](https://github.com/w568w/qq-wayland-clipboard)
+- 设计思路、微信 MIME 类型处理参考 [123hi123/clipsync](https://github.com/123hi123/clipsync)（MIT）
+- QQ MIME 类型映射参考 [SHORiN-KiWATA/linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)，另外还看了 [arabianq/wl-x11-clipsync](https://github.com/arabianq/wl-x11-clipsync) 和 [w568w/qq-wayland-clipboard](https://github.com/w568w/qq-wayland-clipboard)
 - [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
 - [wl-clipboard](https://github.com/bugaevc/wl-clipboard)
-- [xclip](https://github.com/astrand/xclip), [clipnotify](https://github.com/cdown/clipnotify)
+- [xclip](https://github.com/astrand/xclip)、[clipnotify](https://github.com/cdown/clipnotify)
 
-## License
+## 许可证
 
 [MIT](./LICENSE)
