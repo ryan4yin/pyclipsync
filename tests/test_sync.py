@@ -381,15 +381,12 @@ class SyncFallbackTest(LiveSessionTest):
         )
 
 
-class UnreadableOfferLogTest(PyclipsyncTest):
-    """Unit tests for the unreadable-offer diagnostic (no live session needed)."""
-
-    def setUp(self) -> None:
-        self.pc._miss_log.clear()
+class UnreadableOfferTest(PyclipsyncTest):
+    """Unit tests for the unreadable-offer warning (no live session needed)."""
 
     def test_supported_unreadable_offer_is_logged(self):
         with self.assertLogs("pyclipsync", level="WARNING") as cm:
-            self.pc._log_unreadable(
+            self.pc._warn_unreadable(
                 self.pc.W_LABEL,
                 {"image/png", "text/plain"},
                 self.pc.W_SUPPORTED,
@@ -398,18 +395,8 @@ class UnreadableOfferLogTest(PyclipsyncTest):
 
     def test_unknown_offers_are_ignored(self):
         with self.assertNoLogs("pyclipsync", level="WARNING"):
-            self.pc._log_unreadable(
+            self.pc._warn_unreadable(
                 self.pc.W_LABEL, {"application/x-foo"}, self.pc.W_SUPPORTED
-            )
-
-    def test_repeated_identical_offer_is_throttled(self):
-        with self.assertLogs("pyclipsync", level="WARNING"):
-            self.pc._log_unreadable(
-                self.pc.W_LABEL, {"image/png"}, self.pc.W_SUPPORTED
-            )
-        with self.assertNoLogs("pyclipsync", level="WARNING"):
-            self.pc._log_unreadable(
-                self.pc.W_LABEL, {"image/png"}, self.pc.W_SUPPORTED
             )
 
 
