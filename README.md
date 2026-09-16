@@ -70,6 +70,10 @@ pyclipsync adds what they lack:
 - **a real state machine**: per-side sha256 digest, read + dedup + push
   atomic under one lock, destination recorded from a readback, 5s pollers
   retrying failed pushes
+- **no redundant work**: a burst of watcher events is coalesced into one
+  state read, and binary (`image/png`/`image/jpeg`) syncs skip the
+  destination readback (they are byte-exact), so a large image is not
+  transferred twice per copy
 - **no destructive pushes**: empty or unreadable sources are never
   propagated; unservable targets fall back to the next one
 - **integration-tested end to end** — the bash tools ship no tests: 12
@@ -150,8 +154,8 @@ failure the workdir is kept and the daemon log tail is printed.
 
 The same file also holds unit tests for the internals (unreadable-offer
 diagnostic, watcher recycle/backoff, the syncer state machine, image-over-URI
-priority, owner/watcher cleanup). They need no graphical session, so only the
-integration class skips
+priority, event coalescing, binary readback, owner/watcher cleanup). They need
+no graphical session, so only the integration class skips
 on a headless machine. `nix build` runs them via the package's `checkPhase`,
 and CI runs them on every push.
 

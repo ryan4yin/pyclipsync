@@ -106,6 +106,12 @@ X_TARGETS = {
     "html": X_HTML,
 }
 
+# Kinds that survive xclip and wl-copy byte-exact (unlike text/*, which wl-copy
+# reshapes with a trailing newline). After a successful push these need no
+# destination readback: the pushed state *is* the destination state, so reading
+# it back would just re-transfer the whole image.
+_BYTE_EXACT_KINDS = frozenset({"png", "jpeg"})
+
 # Types this tool knows how to read. Used only by the diagnostic below, so an
 # unrelated MIME (application/*, primary selection, ...) does not warn.
 W_SUPPORTED = set(W_TEXT_TYPES) | {W_PNG, W_JPEG, W_HTML, W_URI}
@@ -125,6 +131,12 @@ CLIPBOARD_TIMEOUT = _env_seconds("CLIPBOARD_TIMEOUT", 3.0)
 # Poller interval. Watchers are event-driven; the pollers are only a safety net
 # for missed events, so this can be coarse, which keeps idle CPU low.
 POLL_INTERVAL_SECONDS = _env_seconds("POLL_INTERVAL_SECONDS", 5.0)
+
+# Watcher events arrive in bursts: one Wayland offer of several mime types fires
+# one wl-paste --watch per type, and our own push re-triggers the watchers, so
+# the same state would be read and hashed several times. Wait this long after
+# the last event before reading, so a burst costs a single read instead.
+EVENT_DEBOUNCE_SECONDS = _env_seconds("EVENT_DEBOUNCE_SECONDS", 0.05)
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
@@ -497,6 +509,63 @@ def push_w_to_x(state) -> bool:
     return True
 
 
+class _Coalescer:
+    """Coalesce a burst of change events into one callback invocation.
+
+    Watchers fire several times for a single logical copy (one
+    `wl-paste --watch` per offered mime type, plus the echo of our own push),
+    and reading the state for each event would transfer and hash the same
+    payload repeatedly. Waiting out a short quiet period first makes a burst
+    cost one read. The callback runs in its own thread, so it never blocks the
+    watcher that poked it.
+    """
+
+    def __init__(self, fn, delay: float):
+        self._fn = fn
+        self._delay = delay
+        self._event = threading.Event()
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True, name="coalescer").start()
+
+    def poke(self) -> None:
+        if not self._stop.is_set():
+            self._event.set()
+
+    def stop(self) -> None:
+        """Drop any pending poke and let the worker exit (used at shutdown)."""
+        self._stop.set()
+        self._event.set()
+
+    def _run(self) -> None:
+        while True:
+            self._event.wait()
+            self._event.clear()
+            if self._stop.is_set():
+                return
+            time.sleep(self._delay)
+            # Events during the sleep are covered by the read below; events
+            # during the callback re-arm the flag and force another read.
+            self._event.clear()
+            if self._stop.is_set():
+                return
+            try:
+                self._fn()
+            except Exception:  # noqa: BLE001 - the worker must never die
+                log.exception("coalesced change handler failed")
+
+
+def _destination_after_push(state, readback):
+    """State to record for the side that just received a push.
+
+    Binary mimes survive both helpers byte-exact, so the pushed state *is* the
+    destination and the readback (which would re-transfer the whole image) is
+    skipped. Text may be reshaped by wl-copy, so it is measured.
+    """
+    if state[0] in _BYTE_EXACT_KINDS:
+        return state
+    return readback() or state
+
+
 class Syncer:
     def __init__(self):
         self.lock = threading.Lock()
@@ -511,10 +580,7 @@ class Syncer:
         # which is what causes X -> W -> X echo ping-pong under rapid copies.
         # Bookkeeping (last_*) is only updated once the push succeeds, so a
         # failed push is retried on the next event/poll instead of stalling.
-        # The destination side is recorded from a readback, not from the
-        # pushed payload: wl-copy does not preserve text byte-exactly (it
-        # appends a trailing newline to piped input), so the measured state
-        # is the only source of truth for future dedup decisions.
+        # See _destination_after_push for how the destination is recorded.
         with self.lock:
             state = x_state()
             if state is None:
@@ -528,7 +594,7 @@ class Syncer:
             log.info("X clipboard: %s", state[0])
             if push_x_to_w(state):
                 self.last_x = state
-                self.last_w = w_state() or state
+                self.last_w = _destination_after_push(state, w_state)
 
     def on_w_change(self):
         with self.lock:
@@ -543,7 +609,7 @@ class Syncer:
             log.info("Wayland clipboard: %s", state[0])
             if push_w_to_x(state):
                 self.last_w = state
-                self.last_x = x_state() or state
+                self.last_x = _destination_after_push(state, x_state)
 
 
 def _watch_loop(run_once, name: str) -> None:
@@ -565,16 +631,16 @@ def _watch_loop(run_once, name: str) -> None:
         delay = min(delay * 2, WATCH_BACKOFF_MAX)
 
 
-def watch_clipnotify(syncer: Syncer):
+def watch_clipnotify(poke):
     """X -> W: forward each X11 selection owner change.
 
     clipnotify (nixpkgs) is a one-shot trigger by design: it blocks until the
     next CLIPBOARD/PRIMARY owner-change event and then exits silently (no
     output, no flags). Its intended usage is a relaunch loop
     (`while clipnotify; do ...; done`), so we do exactly that: every exit
-    means "something changed", and we re-read the X state afterwards.
-    PRIMARY (click-selection) changes also trigger it, but the digest-based
-    dedup in Syncer.on_x_change filters those out.
+    means "something changed", and we poke the coalescer to re-read the X
+    state. PRIMARY (click-selection) changes also trigger it, but the
+    digest-based dedup in Syncer.on_x_change filters those out.
     """
     clipnotify = shutil.which("clipnotify")
     if clipnotify is None:
@@ -595,7 +661,7 @@ def watch_clipnotify(syncer: Syncer):
             _unregister_watcher(p)
             if p.poll() is None:
                 _terminate_proc(p)
-        syncer.on_x_change()
+        poke()
 
     _watch_loop(once, "clipnotify")
 
@@ -659,14 +725,15 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
                 _terminate_proc(p)
 
 
-def watch_wayland(syncer: Syncer, mime: str):
+def watch_wayland(poke, mime: str):
     """W -> X: forward each Wayland clipboard offer of the given mime type.
 
     wl-paste --watch takes exactly one command (exec'ed as-is, no shell):
     it runs it with the offer data on stdin whenever a new offer containing
     the given type appears. We use bare `echo`, which ignores stdin and
-    prints a single newline per offer -- a pure change signal. We re-read
-    the full state afterwards.
+    prints a single newline per offer -- a pure change signal. We poke the
+    coalescer to re-read the full state, collapsing the several types an
+    offer carries into a single read.
 
     The watch child is recycled every WATCH_RECYCLE_SECONDS (see _watch_once)
     so a wedged watcher cannot silently stall W -> X sync; an offer missed in
@@ -676,7 +743,7 @@ def watch_wayland(syncer: Syncer, mime: str):
 
     def on_event() -> None:
         log.debug("watch %s: new offer", mime)
-        syncer.on_w_change()
+        poke()
 
     _watch_loop(
         lambda: _watch_once(cmd, on_event, WATCH_RECYCLE_SECONDS), f"watch {mime}"
@@ -706,8 +773,10 @@ def main():
     signal.signal(signal.SIGINT, _handle_shutdown)
 
     syncer = Syncer()
+    x_coalescer = _Coalescer(syncer.on_x_change, EVENT_DEBOUNCE_SECONDS)
+    w_coalescer = _Coalescer(syncer.on_w_change, EVENT_DEBOUNCE_SECONDS)
     threading.Thread(
-        target=watch_clipnotify, args=(syncer,), daemon=True, name="x2w"
+        target=watch_clipnotify, args=(x_coalescer.poke,), daemon=True, name="x2w"
     ).start()
     threading.Thread(
         target=watch_x_poll,
@@ -723,7 +792,10 @@ def main():
     ).start()
     for mime in W_WATCH_TYPES:
         threading.Thread(
-            target=watch_wayland, args=(syncer, mime), daemon=True, name=f"w2x-{mime}"
+            target=watch_wayland,
+            args=(w_coalescer.poke, mime),
+            daemon=True,
+            name=f"w2x-{mime}",
         ).start()
 
     log.info(
@@ -732,6 +804,8 @@ def main():
         os.environ.get("WAYLAND_DISPLAY"),
     )
     _shutdown.wait()
+    x_coalescer.stop()
+    w_coalescer.stop()
     _cleanup_watchers()
     _cleanup_owners()
 

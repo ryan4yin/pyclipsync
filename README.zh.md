@@ -46,6 +46,7 @@ pyclipsync 补的洞：
 
 - `text/html` 双向都同步（QQ 富文本）
 - 真正的状态机：两边各记一份 sha256，读取、判重、推送在同一把锁里一次做完，不会互相打架；目标侧状态以实际读回为准（`wl-copy` 偷偷加换行这种坑不会把判重带偏）；5 秒轮询兜底，推失败了下轮自动重试
+- 不做无用功：watcher 的一次事件风暴会合并成一次状态读取；二进制（`image/png`/`image/jpeg`）同步跳过目标侧回读（本来就逐字节一致），一张大图不会在复制时被传两遍
 - 绝不推垃圾：剪贴板是空的、或者读不出来，就什么都不动；某个 target 读不出来就换下一个试
 - 自带端到端集成测试（bash 工具一个测试都没有）：12 个用例在真实的 X11 + Wayland 会话里跑真实守护进程，每种类型双向逐字节校验。详见[测试](#测试)
 
@@ -109,7 +110,7 @@ flake.packages.${builtins.currentSystem}.default
 
 集成测试在 [`tests/test_sync.py`](./tests/test_sync.py)，标准库 `unittest`，没有额外依赖。会在真实的 X11 (XWayland) + Wayland 会话里把守护进程跑起来，把每种类型双向同步都按字节校验一遍，包括 QQ 表情（`gnome-copied-files`）和快速连续复制两次的竞态。没有 `DISPLAY` / `WAYLAND_DISPLAY` / 辅助工具时整套自动跳过；失败了会保留工作目录、打印守护进程日志尾部，方便排查。
 
-同一个文件里还有一组单元测试（读不出的 offer 诊断、watcher 重建/退避、状态机、图片优先于 URI 的优先级、owner/watcher 清理），它们不需要图形会话，无头机器上只有集成类会跳过；`nix build` 会通过 `checkPhase` 跑，CI 每次 push 也会跑。
+同一个文件里还有一组单元测试（读不出的 offer 诊断、watcher 重建/退避、状态机、图片优先于 URI 的优先级、事件合并、二进制回读、owner/watcher 清理），它们不需要图形会话，无头机器上只有集成类会跳过；`nix build` 会通过 `checkPhase` 跑，CI 每次 push 也会跑。
 
 ```sh
 # 测仓库里的 pyclipsync.py

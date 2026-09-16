@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -679,6 +680,70 @@ class SyncerTest(unittest.TestCase):
         ) as push:
             self.syncer.on_x_change()
         push.assert_not_called()
+
+    def test_x2w_binary_skips_destination_readback(self):
+        """Binary mimes survive wl-copy byte-exact, so no readback is needed."""
+        src = self.state(b"\x89PNG-bytes", "png")
+        with patch.object(self.pc, "x_state", return_value=src), patch.object(
+            self.pc, "push_x_to_w", return_value=True
+        ), patch.object(self.pc, "w_state") as readback:
+            self.syncer.on_x_change()
+        readback.assert_not_called()
+        self.assertEqual(self.syncer.last_x, src)
+        self.assertEqual(self.syncer.last_w, src)
+
+    def test_w2x_binary_skips_destination_readback(self):
+        src = self.state(b"\x89PNG-bytes", "png")
+        with patch.object(self.pc, "w_state", return_value=src), patch.object(
+            self.pc, "push_w_to_x", return_value=True
+        ), patch.object(self.pc, "x_state") as readback:
+            self.syncer.on_w_change()
+        readback.assert_not_called()
+        self.assertEqual(self.syncer.last_w, src)
+        self.assertEqual(self.syncer.last_x, src)
+
+
+class CoalescerTest(unittest.TestCase):
+    """The coalescer must collapse an event burst into a single read."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_burst_runs_the_callback_once(self):
+        calls = []
+        done = threading.Event()
+
+        def fn():
+            calls.append(1)
+            done.set()
+
+        coalescer = self.pc._Coalescer(fn, 0.1)
+        for _ in range(5):
+            coalescer.poke()
+        self.assertTrue(done.wait(5), "coalesced callback never ran")
+        time.sleep(0.3)  # a late extra read would show up here
+        self.assertEqual(len(calls), 1)
+
+    def test_separate_bursts_each_run_the_callback(self):
+        calls = []
+        coalescer = self.pc._Coalescer(lambda: calls.append(1), 0.05)
+        coalescer.poke()
+        time.sleep(0.4)
+        coalescer.poke()
+        time.sleep(0.4)
+        self.assertEqual(len(calls), 2)
+
+    def test_stop_drops_a_pending_poke(self):
+        calls = []
+        coalescer = self.pc._Coalescer(lambda: calls.append(1), 0.2)
+        coalescer.stop()
+        coalescer.poke()
+        time.sleep(0.5)
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
