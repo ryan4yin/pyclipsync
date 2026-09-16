@@ -7,7 +7,7 @@
 
 python3Packages.buildPythonApplication {
   pname = "pyclipsync";
-  version = "0.1.2";
+  version = "0.1.3";
   src = ../.;
 
   # single script, no third-party python deps
