@@ -113,11 +113,6 @@ X_TARGETS = {
 # it back would just re-transfer the whole image.
 _BYTE_EXACT_KINDS = frozenset({"png", "jpeg"})
 
-# Types this tool knows how to read. Used only by the diagnostic below, so an
-# unrelated MIME (application/*, primary selection, ...) does not warn.
-W_SUPPORTED = set(W_TEXT_TYPES) | {W_PNG, W_JPEG, W_HTML, W_URI}
-X_SUPPORTED = set(X_TEXT_TYPES) | {X_PNG, X_JPEG, X_HTML, X_URI, X_GNOME_FILES}
-
 # Recycle each watcher child every N seconds. A helper can wedge (stay alive but
 # stop delivering events), which would otherwise stall sync until the whole
 # service is restarted; bounding its lifetime makes it self-heal. Env-overridable
@@ -375,14 +370,40 @@ def normalize_uri(data: bytes) -> bytes:
     return "\n".join(out).encode("utf-8") + b"\n" if out else b""
 
 
-def h(data: bytes | None) -> str:
+def digest(data: bytes | None) -> str:
     return hashlib.sha256(data or b"").hexdigest()
+
+
+# Read priority per side: (kind, offered types, optional transform), highest
+# first. `transform` normalizes uri payloads (normalize_uri); images and text
+# pass through unchanged. X has two URI spellings: GNOME file copies and QQ
+# stickers use x-special/gnome-copied-files, everyone else text/uri-list.
+X_PRIORITY = (
+    ("png", (X_PNG,), None),
+    ("jpeg", (X_JPEG,), None),
+    ("uri", (X_GNOME_FILES, X_URI), normalize_uri),
+    ("html", (X_HTML,), None),
+    ("text", X_TEXT_TYPES, None),
+)
+W_PRIORITY = (
+    ("png", (W_PNG,), None),
+    ("jpeg", (W_JPEG,), None),
+    ("uri", (W_URI,), normalize_uri),
+    ("html", (W_HTML,), None),
+    ("text", W_TEXT_TYPES, None),
+)
+
+# Types we can read, derived from the priorities so they cannot drift. Used
+# only by the diagnostic below, so an unrelated MIME (application/*, primary
+# selection, ...) does not warn.
+X_SUPPORTED = {t for _, types, _ in X_PRIORITY for t in types}
+W_SUPPORTED = {t for _, types, _ in W_PRIORITY for t in types}
 
 
 # Throttle for the unreadable-offer diagnostic: the state readers run on every
 # event and backstop poll, so log at most once per distinct offer set per
 # window instead of flooding the journal.
-_MISS_LOG_INTERVAL = 30.0
+_MISS_LOG_INTERVAL = _env_seconds("MISS_LOG_INTERVAL", 30.0)
 _miss_log: dict[str, tuple[frozenset[str], float]] = {}
 
 
@@ -411,86 +432,40 @@ def _log_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
     )
 
 
-def x_state():
-    """Read the X11 CLIPBOARD. Returns (kind, data, digest) or None.
+def _read_state(offered, read, priority, supported, label):
+    """Return (kind, data, digest) for the highest-priority readable offer.
 
-    Priority (highest first):
-      png  image/png
-      jpeg image/jpeg
-      uri  x-special/gnome-copied-files  (GNOME file copy, QQ stickers)
-      uri  text/uri-list                 (WeChat images, generic file list)
-      html text/html                     (QQ rich text)
-      text UTF8_STRING / text/plain / STRING
-
-    Image bytes outrank a file URI when both are offered; see the module
-    docstring for why.
+    `priority` is a side's (kind, types, transform) table; see X_PRIORITY.
+    Reading is best-effort, so a candidate that cannot be read is skipped and
+    the next one is tried; if a supported type stays unreadable, warn once.
     """
+    if not offered or offered == {"TARGETS"}:
+        return None
+    for kind, types, transform in priority:
+        for mime in types:
+            if mime not in offered:
+                continue
+            data = read(mime)
+            if data and transform is not None:
+                data = transform(data)
+            if data:
+                return (kind, data, digest(data))
+    _log_unreadable(label, offered, supported)
+    return None
+
+
+def x_state():
+    """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
     targets = x_targets()
     log.debug("read X: %d targets", len(targets))
-    if not targets or targets == {"TARGETS"}:
-        return None
-    if X_PNG in targets:
-        data = x_read(X_PNG)
-        if data:
-            return ("png", data, h(data))
-    if X_JPEG in targets:
-        data = x_read(X_JPEG)
-        if data:
-            return ("jpeg", data, h(data))
-    if X_GNOME_FILES in targets:
-        data = normalize_uri(x_read(X_GNOME_FILES) or b"")
-        if data:
-            return ("uri", data, h(data))
-    if X_URI in targets:
-        data = normalize_uri(x_read(X_URI) or b"")
-        if data:
-            return ("uri", data, h(data))
-    if X_HTML in targets:
-        data = x_read(X_HTML)
-        if data:
-            return ("html", data, h(data))
-    for target in X_TEXT_TYPES:
-        if target in targets:
-            data = x_read(target)
-            if data:
-                return ("text", data, h(data))
-    _log_unreadable("X11 clipboard", targets, X_SUPPORTED)
-    return None
+    return _read_state(targets, x_read, X_PRIORITY, X_SUPPORTED, "X11 clipboard")
 
 
 def w_state():
-    """Read the Wayland clipboard. Returns (kind, data, digest) or None.
-
-    Priority: png > jpeg > uri-list > html > text. Image bytes outrank a
-    file URI when both are offered; see the module docstring for why.
-    """
+    """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
     types = wl_types()
     log.debug("read W: %d types", len(types))
-    if not types:
-        return None
-    if W_PNG in types:
-        data = wl_read(W_PNG)
-        if data:
-            return ("png", data, h(data))
-    if W_JPEG in types:
-        data = wl_read(W_JPEG)
-        if data:
-            return ("jpeg", data, h(data))
-    if W_URI in types:
-        data = normalize_uri(wl_read(W_URI) or b"")
-        if data:
-            return ("uri", data, h(data))
-    if W_HTML in types:
-        data = wl_read(W_HTML)
-        if data:
-            return ("html", data, h(data))
-    for text_mime in W_TEXT_TYPES:
-        if text_mime in types:
-            data = wl_read(text_mime)
-            if data:
-                return ("text", data, h(data))
-    _log_unreadable("Wayland clipboard", types, W_SUPPORTED)
-    return None
+    return _read_state(types, wl_read, W_PRIORITY, W_SUPPORTED, "Wayland clipboard")
 
 
 def push_x_to_w(state) -> bool:
@@ -556,7 +531,7 @@ class Syncer:
             if state[2] == (self.last_w or ("", b"", ""))[2]:
                 log.debug("X -> W: already in sync, skipping")
                 return
-            log.info("X clipboard: %s", state[0])
+            log.info("X11 clipboard: %s", state[0])
             if push_x_to_w(state):
                 self.last_x = state
                 self.last_w = _destination_after_push(state, w_state)
@@ -726,23 +701,23 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if shutil.which("wl-copy") is None or shutil.which("wl-paste") is None:
-        log.error("wl-clipboard (wl-copy/wl-paste) not found in PATH")
+    missing = [t for t in ("wl-copy", "wl-paste", "xclip") if shutil.which(t) is None]
+    if missing:
+        log.error("missing required clipboard helpers in PATH: %s", " ".join(missing))
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
 
     syncer = Syncer()
-    threading.Thread(
-        target=watch_clipnotify, args=(syncer,), daemon=True, name="x2w"
-    ).start()
-    threading.Thread(
-        target=watch_wayland, args=(syncer,), daemon=True, name="w2x"
-    ).start()
-    threading.Thread(
-        target=watch_poll, args=(syncer,), daemon=True, name="backstop"
-    ).start()
+    for target, name in (
+        (watch_clipnotify, "x2w"),
+        (watch_wayland, "w2x"),
+        (watch_poll, "backstop"),
+    ):
+        threading.Thread(
+            target=target, args=(syncer,), daemon=True, name=name
+        ).start()
 
     log.info(
         "pyclipsync started (DISPLAY=%s, WAYLAND_DISPLAY=%s)",
