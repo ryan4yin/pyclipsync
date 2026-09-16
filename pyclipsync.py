@@ -414,6 +414,7 @@ def x_state():
     docstring for why.
     """
     targets = x_targets()
+    log.debug("read X: %d targets", len(targets))
     if not targets or targets == {"TARGETS"}:
         return None
     if X_PNG in targets:
@@ -452,6 +453,7 @@ def w_state():
     file URI when both are offered; see the module docstring for why.
     """
     types = wl_types()
+    log.debug("read W: %d types", len(types))
     if not types:
         return None
     if W_PNG in types:

@@ -81,9 +81,10 @@ pyclipsync adds what they lack:
   fast one — so a large image is not transferred while nothing is happening
 - **no destructive pushes**: empty or unreadable sources are never
   propagated; unservable targets fall back to the next one
-- **integration-tested end to end** — the bash tools ship no tests: 12
+- **integration-tested end to end** — the bash tools ship no tests: 15
   cases run the real daemon under a live X11 + Wayland session, every
-  type byte-exact in both directions. See [Testing](#testing).
+  type byte-exact in both directions, plus startup sync and the backstop
+  poll. See [Testing](#testing).
 
 ## Dependencies
 
@@ -153,9 +154,12 @@ Integration tests live in [`tests/test_sync.py`](./tests/test_sync.py)
 (standard-library `unittest`, no extra dependencies). They start a real daemon
 under a **live X11 (XWayland) + Wayland session** and verify byte-exact sync
 for every supported type in both directions, including the QQ sticker
-(`gnome-copied-files`) case and a rapid double-copy race. The whole suite
-skips when `DISPLAY` / `WAYLAND_DISPLAY` / the helper tools are missing; on
-failure the workdir is kept and the daemon log tail is printed.
+(`gnome-copied-files`) case and a rapid double-copy race. A second class starts
+its own daemon per test for the paths the watchers do not drive: the initial
+read at startup, backstop recovery after the `wl-paste` watcher is wedged, and
+an idle window that asserts no reads happen. The whole suite skips when
+`DISPLAY` / `WAYLAND_DISPLAY` / the helper tools are missing; on failure the
+workdir is kept and the daemon log tail is printed.
 
 The same file also holds unit tests for the internals (unreadable-offer
 diagnostic, watcher recycle/backoff, the syncer state machine, image-over-URI

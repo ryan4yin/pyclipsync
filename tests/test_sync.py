@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -56,18 +57,42 @@ def _missing() -> str:
     return ""
 
 
-@unittest.skipIf(_missing(), f"skipped: {_missing() or 'no live session'}")
-class SyncTest(unittest.TestCase):
-    """Sequential sync tests against one daemon instance.
+def _find_daemon_child(pid: int, needle: str) -> int | None:
+    """Return the pid of a direct child of `pid` whose cmdline contains needle.
 
-    Tests share the two clipboards, so order matters: method names are
-    numbered (unittest runs them in sorted name order).
+    Threads share the process, but /proc lists children per task, so scan every
+    task's `children` file. Used to reach into the daemon (e.g. to wedge its
+    wl-paste watcher) without adding a control interface to the daemon.
+    """
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            children = (task / "children").read_text().split()
+        except OSError:
+            continue
+        for child in children:
+            try:
+                cmdline = Path(f"/proc/{child}/cmdline").read_bytes()
+            except OSError:
+                continue
+            if needle.encode() in cmdline:
+                return int(child)
+    return None
+
+
+@unittest.skipIf(_missing(), f"skipped: {_missing() or 'no live session'}")
+class LiveSessionTest(unittest.TestCase):
+    """Shared harness: a daemon under test plus clipboard plumbing.
+
+    The live-session tests share the two clipboards, so they run one at a time.
+    SyncTest starts a single daemon for the class; SyncFallbackTest starts one
+    per test with its own environment.
     """
 
     _failed = False
+    proc = None
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def _start_daemon(cls, env=None, settle: float = 2.0) -> None:
         cls.workdir_path = Path(tempfile.mkdtemp(prefix="pyclipsync-test."))
         cls.log_path = cls.workdir_path / "daemon.log"
         cls.log_file = open(cls.log_path, "wb")
@@ -75,10 +100,11 @@ class SyncTest(unittest.TestCase):
             DAEMON_CMD,
             stdout=cls.log_file,
             stderr=subprocess.STDOUT,
+            env=dict(os.environ, **(env or {})),
             start_new_session=True,
         )
         cls._wait_started(timeout=15.0)
-        time.sleep(2.0)  # let the startup sync settle
+        time.sleep(settle)
 
     @classmethod
     def _wait_started(cls, timeout: float) -> None:
@@ -95,7 +121,9 @@ class SyncTest(unittest.TestCase):
         raise RuntimeError(f"daemon did not start in time, log: {cls.log_path}")
 
     @classmethod
-    def tearDownClass(cls) -> None:
+    def _stop_daemon(cls) -> None:
+        if cls.proc is None:
+            return
         if cls.proc.poll() is None:
             cls.proc.terminate()
             try:
@@ -111,11 +139,15 @@ class SyncTest(unittest.TestCase):
             print("\n".join(lines[-40:]))
         else:
             shutil.rmtree(cls.workdir_path, ignore_errors=True)
+        cls.proc = None
 
     def run(self, result):
         super().run(result)
         if result.failures or result.errors:
-            SyncTest._failed = True
+            type(self)._failed = True
+
+    def daemon_log(self) -> str:
+        return self.log_path.read_text(errors="replace")
 
     # -- clipboard plumbing --------------------------------------------------
 
@@ -188,6 +220,22 @@ class SyncTest(unittest.TestCase):
             f"expected {len(expected)} bytes, got {len(actual)} bytes: "
             f"{actual[:64]!r}"
         )
+
+
+class SyncTest(LiveSessionTest):
+    """Sequential sync tests against one daemon instance.
+
+    Tests share the two clipboards, so order matters: method names are
+    numbered (unittest runs them in sorted name order).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._start_daemon()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._stop_daemon()
 
     # -- W -> X ---------------------------------------------------------------
 
@@ -267,6 +315,61 @@ class SyncTest(unittest.TestCase):
         warns = [l for l in log.splitlines() if " WARNING " in l]
         if warns:
             print("\npyclipsync warnings (non-fatal):\n" + "\n".join(warns))
+
+
+class SyncFallbackTest(LiveSessionTest):
+    """Paths that do not go through a watcher.
+
+    SyncTest always changes the clipboard while the daemon is already running,
+    so it only exercises the watchers. These tests cover the two remaining
+    paths: the initial read at startup, and the backstop poll that recovers an
+    event a watcher missed. Each test owns its daemon and its environment.
+    """
+
+    def tearDown(self) -> None:
+        type(self)._stop_daemon()
+
+    def test_startup_syncs_an_existing_clipboard(self):
+        # No daemon yet: the clipboard already holds a value, so only the
+        # startup read can carry it to the other side.
+        data = f"tc-startup-{secrets.token_hex(4)}".encode()
+        self.write_w("text/plain", data)
+        type(self)._start_daemon(settle=0.5)
+        self.wait_value(lambda: self.read_x("UTF8_STRING"), self.wl_text(data))
+
+    def test_backstop_recovers_a_missed_w_change(self):
+        type(self)._start_daemon(env={"IDLE_POLL_SECONDS": "2"}, settle=0.5)
+        watcher = _find_daemon_child(self.proc.pid, "--watch")
+        self.assertIsNotNone(watcher, "wl-paste watcher child not found")
+        os.kill(watcher, signal.SIGSTOP)  # wedge the watcher: no more events
+        try:
+            data = f"tc-backstop-{secrets.token_hex(4)}".encode()
+            self.write_w("text/plain", data)
+            # The wedged watcher cannot deliver this change; only the backstop
+            # poll can, so it must still land within its (shortened) interval.
+            self.wait_value(lambda: self.read_x("UTF8_STRING"), self.wl_text(data))
+        finally:
+            try:
+                os.kill(watcher, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+
+    def test_idle_does_not_read_the_clipboard(self):
+        # DEBUG logs one line per state read. With the default 60s backstop an
+        # idle daemon must not read at all in a window well under that, which a
+        # regression to a fast poll would immediately break.
+        type(self)._start_daemon(env={"DEBUG": "1"}, settle=0.5)
+        data = f"tc-idle-{secrets.token_hex(4)}".encode()
+        self.write_w("text/plain", data)
+        self.wait_value(lambda: self.read_x("UTF8_STRING"), self.wl_text(data))
+        time.sleep(0.5)  # let the event-driven sync settle
+        before = self.daemon_log().count("read W")
+        time.sleep(6.0)
+        self.assertEqual(
+            self.daemon_log().count("read W"),
+            before,
+            "daemon read the clipboard while idle",
+        )
 
 
 class UnreadableOfferLogTest(unittest.TestCase):
