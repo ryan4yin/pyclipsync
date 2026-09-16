@@ -25,10 +25,12 @@
 
 支持的类型，按优先级从高到低（映射参考 [linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)）：
 
-- **文件/图片链接** — X11 侧：`x-special/gnome-copied-files`（QQ 表情、GNOME 文件复制）或 `text/uri-list`（微信/QQ 图片）；Wayland 侧：`text/uri-list`。同步前归一：去掉 `copy` 头，裸路径统一改写成 `file://`
 - **`image/png`**、**`image/jpeg`** — 两侧同名
+- **文件/图片链接** — X11 侧：`x-special/gnome-copied-files`（QQ 表情、GNOME 文件复制）或 `text/uri-list`（微信/QQ 图片）；Wayland 侧：`text/uri-list`。同步前归一：去掉 `copy` 头，裸路径统一改写成 `file://`
 - **`text/html`** — QQ 富文本，两侧同名
 - **纯文本** — X11 侧 `UTF8_STRING`，Wayland 侧 `text/plain` 或 `text/plain;charset=utf-8`
+
+客户端同时提供图片和文件 URI 时（QQ、Chromium 复制图片会同时放一份 `image/png` 和一个指向缓存/临时文件的 `file://` URI），优先同步图片字节。图片字节到哪都能粘，而 URI 可能指向发送方沙箱命名空间里的路径——接收方若也在沙箱里（比如 Telegram），解析出来就是一个不存在的空文件。
 
 ## 为什么选 pyclipsync
 
@@ -107,7 +109,7 @@ flake.packages.${builtins.currentSystem}.default
 
 集成测试在 [`tests/test_sync.py`](./tests/test_sync.py)，标准库 `unittest`，没有额外依赖。会在真实的 X11 (XWayland) + Wayland 会话里把守护进程跑起来，把每种类型双向同步都按字节校验一遍，包括 QQ 表情（`gnome-copied-files`）和快速连续复制两次的竞态。没有 `DISPLAY` / `WAYLAND_DISPLAY` / 辅助工具时整套自动跳过；失败了会保留工作目录、打印守护进程日志尾部，方便排查。
 
-同一个文件里还有一组单元测试（读不出的 offer 诊断、watcher 重建/退避、状态机、owner/watcher 清理），它们不需要图形会话，无头机器上只有集成类会跳过；`nix build` 会通过 `checkPhase` 跑，CI 每次 push 也会跑。
+同一个文件里还有一组单元测试（读不出的 offer 诊断、watcher 重建/退避、状态机、图片优先于 URI 的优先级、owner/watcher 清理），它们不需要图形会话，无头机器上只有集成类会跳过；`nix build` 会通过 `checkPhase` 跑，CI 每次 push 也会跑。
 
 ```sh
 # 测仓库里的 pyclipsync.py

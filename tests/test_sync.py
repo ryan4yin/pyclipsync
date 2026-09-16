@@ -400,6 +400,60 @@ class WStateTextTest(unittest.TestCase):
                 self.assertEqual(state[0], "text")
 
 
+class ImageOverUriPriorityTest(unittest.TestCase):
+    """An offered image must win over a file URI when both are present.
+
+    QQ (and Chromium/Electron generally) put image/png on the clipboard next
+    to a file:// URI for a cache or temp file. The URI is not portable: for a
+    sandboxed sender it names a path inside its own mount namespace, which a
+    sandboxed receiver (e.g. Telegram) resolves to a non-existent, empty
+    file. The image bytes paste anywhere, so they take priority.
+    """
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_x_state_prefers_png_over_gnome_copied_files(self):
+        reads = {self.pc.X_PNG: b"\x89PNG-bytes"}
+        with patch.object(
+            self.pc, "x_targets", return_value={self.pc.X_PNG, self.pc.X_GNOME_FILES}
+        ), patch.object(self.pc, "x_read", side_effect=reads.get):
+            state = self.pc.x_state()
+        self.assertIsNotNone(state)
+        self.assertEqual(state[0], "png")
+        self.assertEqual(state[1], b"\x89PNG-bytes")
+
+    def test_x_state_prefers_jpeg_over_uri_list(self):
+        reads = {self.pc.X_JPEG: b"jpeg-bytes"}
+        with patch.object(
+            self.pc, "x_targets", return_value={self.pc.X_JPEG, self.pc.X_URI}
+        ), patch.object(self.pc, "x_read", side_effect=reads.get):
+            state = self.pc.x_state()
+        self.assertIsNotNone(state)
+        self.assertEqual(state[0], "jpeg")
+
+    def test_x_state_falls_back_to_uri_without_an_image(self):
+        with patch.object(
+            self.pc, "x_targets", return_value={self.pc.X_GNOME_FILES}
+        ), patch.object(self.pc, "x_read", return_value=b"copy\nfile:///tmp/x.png\n"):
+            state = self.pc.x_state()
+        self.assertIsNotNone(state)
+        self.assertEqual(state[0], "uri")
+        self.assertEqual(state[1], b"file:///tmp/x.png\n")
+
+    def test_w_state_prefers_png_over_uri(self):
+        with patch.object(
+            self.pc, "wl_types", return_value={self.pc.W_PNG, self.pc.W_URI}
+        ), patch.object(self.pc, "wl_read", return_value=b"img-bytes"):
+            state = self.pc.w_state()
+        self.assertIsNotNone(state)
+        self.assertEqual(state[0], "png")
+
+
 class EnvSecondsTest(unittest.TestCase):
     """Unit tests for the positive-float env parser."""
 
