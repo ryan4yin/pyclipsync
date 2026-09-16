@@ -138,12 +138,9 @@ IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 # A clipboard owner can be briefly unresponsive right after a copy (observed
 # with WeChat on X11), so one empty read of an offered type is not conclusive.
 # Retry a couple of times before reporting the offer unreadable, backing off
-# exponentially (READ_RETRY_DELAY, doubling). A read that itself took long (an
-# unresponsive owner, up to CLIPBOARD_TIMEOUT) is not retried: multiplying a
-# multi-second stall under the syncer lock would just delay the newest content.
+# exponentially (READ_RETRY_DELAY_SECONDS, doubling).
 READ_RETRIES = 2
-READ_RETRY_DELAY = 0.15
-READ_RETRY_MAX_ATTEMPT = 1.0
+READ_RETRY_DELAY_SECONDS = 0.18
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
@@ -479,25 +476,21 @@ def _read_state_with_retry(offered, read, priority):
     offered but comes back empty.
 
     An owner that just took the selection may not answer a background reader
-    for a moment, so one empty read is not conclusive. Retries only when a
-    priority type was offered (nothing to retry otherwise) and only while each
-    read stays quick: a read that itself took long (READ_RETRY_MAX_ATTEMPT) is
-    a hung owner, not a brief race, and retrying would multiply the stall.
+    for a moment, so one empty read is not conclusive. Retries with exponential
+    backoff, but only when a priority type was offered, so an empty clipboard
+    or an unrelated MIME costs nothing.
     """
     relevant = any(mime in offered for entry in priority for mime in entry.types)
-    delay = READ_RETRY_DELAY
+    delay = READ_RETRY_DELAY_SECONDS
     for attempt in range(READ_RETRIES + 1):
         if attempt:
             if not relevant:
                 break
             time.sleep(delay)
             delay *= 2
-        started = time.monotonic()
         state = _read_state(offered, read, priority)
         if state is not None:
             return state
-        if time.monotonic() - started > READ_RETRY_MAX_ATTEMPT:
-            break
     return None
 
 

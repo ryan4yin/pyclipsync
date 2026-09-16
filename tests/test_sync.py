@@ -436,7 +436,10 @@ class ReadRetryTest(PyclipsyncTest):
         # Backs off exponentially between attempts.
         self.assertEqual(
             [call.args[0] for call in sleep.call_args_list],
-            [self.pc.READ_RETRY_DELAY * 2**i for i in range(self.pc.READ_RETRIES)],
+            [
+                self.pc.READ_RETRY_DELAY_SECONDS * 2**i
+                for i in range(self.pc.READ_RETRIES)
+            ],
         )
 
     def test_no_retry_for_unsupported_offers(self):
@@ -452,26 +455,6 @@ class ReadRetryTest(PyclipsyncTest):
             )
         self.assertIsNone(state)
         self.assertEqual(seen, [])
-        sleep.assert_not_called()
-
-    def test_a_slow_read_is_not_retried(self):
-        seen = []
-
-        def read(mime):
-            seen.append(mime)
-            return None
-
-        # monotonic() is called before and after the first attempt; a jump
-        # larger than READ_RETRY_MAX_ATTEMPT marks it as a hung owner.
-        clock = [0.0, self.pc.READ_RETRY_MAX_ATTEMPT + 1]
-        with patch.object(
-            self.pc.time, "monotonic", side_effect=lambda: clock.pop(0)
-        ), patch.object(self.pc.time, "sleep") as sleep:
-            state = self.pc._read_state_with_retry(
-                {"UTF8_STRING"}, read, self.priority()
-            )
-        self.assertIsNone(state)
-        self.assertEqual(len(seen), 1)
         sleep.assert_not_called()
         sleep.assert_not_called()
 
