@@ -137,7 +137,8 @@ IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 
 # A clipboard owner can be briefly unresponsive right after a copy (observed
 # with WeChat on X11), so one empty read of an offered type is not conclusive.
-# Retry a couple of times before reporting the offer unreadable.
+# Retry a couple of times before reporting the offer unreadable, backing off
+# exponentially (READ_RETRY_DELAY, doubling).
 READ_RETRIES = 2
 READ_RETRY_DELAY = 0.15
 
@@ -476,17 +477,20 @@ def _read_state_with_retry(offered, read, priority, supported):
 
     An owner that just took the selection may not answer a background reader
     for a moment, so a single empty read is not conclusive; retrying shortly
-    after usually succeeds. Only retries when a supported type was offered, so
-    an empty clipboard or unrelated MIME costs nothing.
+    after usually succeeds. Waits READ_RETRY_DELAY, doubling each retry, and
+    only retries when a supported type was offered, so an empty clipboard or
+    unrelated MIME costs nothing.
     """
     state = _read_state(offered, read, priority)
     if state is not None or not (offered & supported):
         return state
+    delay = READ_RETRY_DELAY
     for _ in range(READ_RETRIES):
-        time.sleep(READ_RETRY_DELAY)
+        time.sleep(delay)
         state = _read_state(offered, read, priority)
         if state is not None:
             return state
+        delay *= 2
     return None
 
 

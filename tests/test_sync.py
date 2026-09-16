@@ -427,12 +427,17 @@ class ReadRetryTest(PyclipsyncTest):
             seen.append(mime)
             return None
 
-        with patch.object(self.pc.time, "sleep"):
+        with patch.object(self.pc.time, "sleep") as sleep:
             state = self.pc._read_state_with_retry(
                 {"UTF8_STRING"}, read, self.priority(), {"UTF8_STRING"}
             )
         self.assertIsNone(state)
         self.assertEqual(len(seen), 1 + self.pc.READ_RETRIES)
+        # Backs off exponentially between attempts.
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [self.pc.READ_RETRY_DELAY * 2**i for i in range(self.pc.READ_RETRIES)],
+        )
 
     def test_no_retry_for_unsupported_offers(self):
         seen = []
