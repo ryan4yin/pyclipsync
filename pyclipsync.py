@@ -140,16 +140,12 @@ CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT_SECONDS", 6.0)
 # idle session does not read the whole clipboard every few seconds.
 IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 
-# A clipboard owner can be briefly unresponsive right after a copy, and can
-# expose a file URI before the image bytes are ready (both observed with WeChat
-# on X11). A read that comes back empty, or with only a URI, is retried a couple
-# of times -- re-listing the offered types each time, since the image can appear
-# on a later offer -- with exponential backoff (READ_RETRY_DELAY_SECONDS,
-# doubling). The URI points into the sender's namespace (e.g. WeChat's
-# /home/ryan/xwechat_files, which does not exist on the host), while the image
-# bytes paste anywhere, so it is worth waiting for them.
+# A clipboard owner can be briefly unresponsive right after a copy (observed
+# with WeChat on X11), so one empty read of an offered type is not conclusive.
+# Retry a couple of times before reporting the offer unreadable, backing off
+# exponentially (READ_RETRY_DELAY_SECONDS, doubling).
 READ_RETRIES = 2
-READ_RETRY_DELAY_SECONDS = 0.5
+READ_RETRY_DELAY_SECONDS = 0.18
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
@@ -460,51 +456,45 @@ def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
         )
 
 
-def _scan(offered, read, priority, supported):
-    """One pass over the priority table; the first readable entry wins."""
+def _read_state(offered, read, priority, supported):
+    """Return the highest-priority readable State, or None.
+
+    An owner can be briefly unresponsive right after a copy, so a scan that
+    finds an offered type but no data is retried a couple of times with
+    exponential backoff before giving up. An offer with no type we handle is
+    not retried.
+    """
     if not offered & supported:
         return None
-    for entry in priority:
-        for mime in entry.types:
-            if mime not in offered:
-                continue
-            data = read(mime)
-            if data and entry.transform is not None:
-                data = entry.transform(data)
-            if data:
-                return State.of(entry.kind, data)
-    return None
 
+    def read_once():
+        for entry in priority:
+            for mime in entry.types:
+                if mime not in offered:
+                    continue
+                data = read(mime)
+                if data and entry.transform is not None:
+                    data = entry.transform(data)
+                if data:
+                    return State.of(entry.kind, data)
+        return None
 
-def _read_state(list_types, read, priority, supported):
-    """Read the clipboard, retrying while the result is not final.
-
-    A read is retried when it comes back empty (the owner has not answered yet)
-    or with only a file URI (the owner exposed a link before the image bytes --
-    WeChat does this), because image bytes paste anywhere while the URI points
-    into the sender's namespace. Anything else ends the retries, and an offer
-    with no type we handle is never retried. Each retry re-lists the offered
-    types, since the image can appear on a later offer. Returns (offered, state).
-    """
-    offered = list_types()
-    state = _scan(offered, read, priority, supported)
     delay = READ_RETRY_DELAY_SECONDS
-    for _ in range(READ_RETRIES):
-        if state is not None and state.kind != "uri":
-            break
-        if not offered & supported:
-            break
-        time.sleep(delay)
-        delay *= 2
-        offered = list_types()
-        state = _scan(offered, read, priority, supported)
-    return offered, state
+    for attempt in range(READ_RETRIES + 1):
+        if attempt:
+            time.sleep(delay)
+            delay *= 2
+        state = read_once()
+        if state is not None:
+            return state
+    return None
 
 
 def x_state():
     """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
-    targets, state = _read_state(x_targets, x_read, X_PRIORITY, X_SUPPORTED)
+    targets = x_targets()
     log.debug("read X: %d targets", len(targets))
+    state = _read_state(targets, x_read, X_PRIORITY, X_SUPPORTED)
     if state is None:
         _warn_unreadable(X_LABEL, targets, X_SUPPORTED)
     return state
@@ -512,8 +502,9 @@ def x_state():
 
 def w_state():
     """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
-    types, state = _read_state(wl_types, wl_read, W_PRIORITY, W_SUPPORTED)
+    types = wl_types()
     log.debug("read W: %d types", len(types))
+    state = _read_state(types, wl_read, W_PRIORITY, W_SUPPORTED)
     if state is None:
         _warn_unreadable(W_LABEL, types, W_SUPPORTED)
     return state
@@ -629,6 +620,17 @@ def _watch_loop(run_once, name: str) -> None:
         delay = min(delay * 2, WATCH_BACKOFF_MAX_SECONDS)
 
 
+def _read_async(fn) -> None:
+    """Run a state read off the watcher thread.
+
+    A read can take a while (a retry, or CLIPBOARD_TIMEOUT on a hung owner), so
+    doing it in the watcher thread would delay the watcher's relaunch and widen
+    its registration gap -- changes in that gap are missed. The syncer lock
+    serializes the concurrent reads.
+    """
+    threading.Thread(target=fn, daemon=True).start()
+
+
 def watch_clipnotify(syncer: Syncer):
     """X -> W: forward each X11 selection owner change.
 
@@ -662,7 +664,7 @@ def watch_clipnotify(syncer: Syncer):
         if p.returncode != 0:
             log.warning("clipnotify exited with status %s", p.returncode)
             return False
-        syncer.on_x_change()
+        _read_async(syncer.on_x_change)
         return True
 
     _watch_loop(once, "clipnotify")
@@ -705,16 +707,19 @@ def watch_wayland(syncer: Syncer):
     `wl-paste --watch echo` runs `echo` on every selection change (echo
     ignores stdin and prints one newline -- a pure change signal); with no
     --type, wl-paste falls back to any offered type, so a single watcher
-    covers every offer instead of one watcher per mime type. We re-read the
-    full state afterwards.
+    covers every offer instead of one watcher per mime type. The read runs off
+    this thread (see _read_async), so the watcher keeps consuming offers.
 
     The watch child is recycled every WATCH_RECYCLE_SECONDS (see _watch_once)
     so a wedged watcher cannot silently stall W -> X sync.
     """
+    def on_event() -> None:
+        _read_async(syncer.on_w_change)
+
     _watch_loop(
         lambda: _watch_once(
             ["wl-paste", "--watch", "echo"],
-            syncer.on_w_change,
+            on_event,
             WATCH_RECYCLE_SECONDS,
         ),
         "wl-paste --watch",
