@@ -36,6 +36,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+import pyclipsync  # noqa: E402 - needs REPO_ROOT on sys.path first
+
 DAEMON_CMD = (
     [os.environ["PYCLIPSYNC"]]
     if "PYCLIPSYNC" in os.environ
@@ -44,6 +47,12 @@ DAEMON_CMD = (
 
 SYNC_TIMEOUT = 10.0
 POLL_INTERVAL = 0.25
+
+
+class PyclipsyncTest(unittest.TestCase):
+    """Base for tests that drive the module directly (no live session)."""
+
+    pc = pyclipsync
 
 
 def _missing() -> str:
@@ -372,16 +381,11 @@ class SyncFallbackTest(LiveSessionTest):
         )
 
 
-class UnreadableOfferLogTest(unittest.TestCase):
+class UnreadableOfferLogTest(PyclipsyncTest):
     """Unit tests for the unreadable-offer diagnostic (no live session needed)."""
 
     def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
-        pyclipsync._miss_log.clear()
+        self.pc._miss_log.clear()
 
     def test_supported_unreadable_offer_is_logged(self):
         with self.assertLogs("pyclipsync", level="WARNING") as cm:
@@ -409,15 +413,8 @@ class UnreadableOfferLogTest(unittest.TestCase):
             )
 
 
-class WatchRecycleTest(unittest.TestCase):
+class WatchRecycleTest(PyclipsyncTest):
     """Unit tests for the watcher recycle helper (no live session needed)."""
-
-    def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
 
     def test_recycles_a_hung_command(self):
         events = []
@@ -442,18 +439,11 @@ class WatchRecycleTest(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 5.0)
 
 
-class WatchLoopTest(unittest.TestCase):
+class WatchLoopTest(PyclipsyncTest):
     """Unit tests for the resilient watcher loop (no live session needed)."""
 
     class _Stop(BaseException):
         """Raised by fake watchers to break out of the otherwise infinite loop."""
-
-    def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
 
     def test_survives_failures(self):
         calls = []
@@ -489,15 +479,8 @@ class WatchLoopTest(unittest.TestCase):
         self.assertEqual(sleeps, [0.2, 0.4, 0.8])
 
 
-class WStateTextTest(unittest.TestCase):
+class WStateTextTest(PyclipsyncTest):
     """w_state() must read charset-qualified text, not just bare text/plain."""
-
-    def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
 
     def test_reads_each_text_variant(self):
         for mime in self.pc.W_TEXT_TYPES:
@@ -510,7 +493,7 @@ class WStateTextTest(unittest.TestCase):
                 self.assertEqual(state[0], "text")
 
 
-class ImageOverUriPriorityTest(unittest.TestCase):
+class ImageOverUriPriorityTest(PyclipsyncTest):
     """An offered image must win over a file URI when both are present.
 
     QQ (and Chromium/Electron generally) put image/png on the clipboard next
@@ -519,13 +502,6 @@ class ImageOverUriPriorityTest(unittest.TestCase):
     sandboxed receiver (e.g. Telegram) resolves to a non-existent, empty
     file. The image bytes paste anywhere, so they take priority.
     """
-
-    def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
 
     def test_x_state_prefers_png_over_gnome_copied_files(self):
         reads = {self.pc.X_PNG: b"\x89PNG-bytes"}
@@ -564,15 +540,10 @@ class ImageOverUriPriorityTest(unittest.TestCase):
         self.assertEqual(state[0], "png")
 
 
-class EnvSecondsTest(unittest.TestCase):
+class EnvSecondsTest(PyclipsyncTest):
     """Unit tests for the positive-float env parser."""
 
     def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
         self.name = "PYCLIPSYNC_TEST_SECONDS"
 
     def test_unset_uses_default(self):
@@ -597,16 +568,11 @@ class EnvSecondsTest(unittest.TestCase):
             self.assertEqual(self.pc._env_seconds(self.name, 5.0), 5.0)
 
 
-class OwnerLifecycleTest(unittest.TestCase):
+class OwnerLifecycleTest(PyclipsyncTest):
     """Unit tests for spawning, tracking and cleaning up clipboard owners."""
 
     def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
-        self.procs = pyclipsync._procs
+        self.procs = self.pc._procs
         with self.procs._owner_lock:
             self.procs._owners.clear()
 
@@ -672,16 +638,11 @@ class OwnerLifecycleTest(unittest.TestCase):
         self.assertEqual(killed, [222222])
 
 
-class WatcherLifecycleTest(unittest.TestCase):
+class WatcherLifecycleTest(PyclipsyncTest):
     """Unit tests for tracking and terminating watcher children."""
 
     def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
-        self.procs = pyclipsync._procs
+        self.procs = self.pc._procs
         with self.procs._watcher_lock:
             self.procs._watchers.clear()
 
@@ -710,19 +671,14 @@ class WatcherLifecycleTest(unittest.TestCase):
             self.assertEqual(self.procs._watchers, set())
 
 
-class SyncerTest(unittest.TestCase):
+class SyncerTest(PyclipsyncTest):
     """Unit tests for the dedup / loop-prevention state machine."""
 
     def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
         self.syncer = pyclipsync.Syncer()
 
     def state(self, data: bytes, kind: str = "text"):
-        return (kind, data, self.pc.h(data))
+        return (kind, data, self.pc.digest(data))
 
     def test_w2x_pushes_and_records_measured_destination(self):
         src = self.state(b"hi")
@@ -814,15 +770,8 @@ class SyncerTest(unittest.TestCase):
         self.assertEqual(self.syncer.last_x, src)
 
 
-class PollBackstopTest(unittest.TestCase):
+class PollBackstopTest(PyclipsyncTest):
     """The backstop poll reads both sides, starting immediately."""
-
-    def setUp(self) -> None:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import pyclipsync
-
-        self.pc = pyclipsync
 
     def test_reads_both_sides(self):
         calls = []
