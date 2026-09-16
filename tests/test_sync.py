@@ -490,7 +490,7 @@ class WStateTextTest(PyclipsyncTest):
                 ), patch.object(self.pc, "wl_read", return_value=b"hi"):
                     state = self.pc.w_state()
                 self.assertIsNotNone(state)
-                self.assertEqual(state[0], "text")
+                self.assertEqual(state.kind, "text")
 
 
 class ImageOverUriPriorityTest(PyclipsyncTest):
@@ -510,8 +510,8 @@ class ImageOverUriPriorityTest(PyclipsyncTest):
         ), patch.object(self.pc, "x_read", side_effect=reads.get):
             state = self.pc.x_state()
         self.assertIsNotNone(state)
-        self.assertEqual(state[0], "png")
-        self.assertEqual(state[1], b"\x89PNG-bytes")
+        self.assertEqual(state.kind, "png")
+        self.assertEqual(state.data, b"\x89PNG-bytes")
 
     def test_x_state_prefers_jpeg_over_uri_list(self):
         reads = {self.pc.X_JPEG: b"jpeg-bytes"}
@@ -520,7 +520,7 @@ class ImageOverUriPriorityTest(PyclipsyncTest):
         ), patch.object(self.pc, "x_read", side_effect=reads.get):
             state = self.pc.x_state()
         self.assertIsNotNone(state)
-        self.assertEqual(state[0], "jpeg")
+        self.assertEqual(state.kind, "jpeg")
 
     def test_x_state_falls_back_to_uri_without_an_image(self):
         with patch.object(
@@ -528,8 +528,8 @@ class ImageOverUriPriorityTest(PyclipsyncTest):
         ), patch.object(self.pc, "x_read", return_value=b"copy\nfile:///tmp/x.png\n"):
             state = self.pc.x_state()
         self.assertIsNotNone(state)
-        self.assertEqual(state[0], "uri")
-        self.assertEqual(state[1], b"file:///tmp/x.png\n")
+        self.assertEqual(state.kind, "uri")
+        self.assertEqual(state.data, b"file:///tmp/x.png\n")
 
     def test_w_state_prefers_png_over_uri(self):
         with patch.object(
@@ -537,7 +537,7 @@ class ImageOverUriPriorityTest(PyclipsyncTest):
         ), patch.object(self.pc, "wl_read", return_value=b"img-bytes"):
             state = self.pc.w_state()
         self.assertIsNotNone(state)
-        self.assertEqual(state[0], "png")
+        self.assertEqual(state.kind, "png")
 
 
 class EnvSecondsTest(PyclipsyncTest):
@@ -566,6 +566,42 @@ class EnvSecondsTest(PyclipsyncTest):
             self.pc.log, "warning"
         ):
             self.assertEqual(self.pc._env_seconds(self.name, 5.0), 5.0)
+
+
+class NormalizeUriTest(PyclipsyncTest):
+    """Unit tests for the uri-list / gnome-copied-files normalizer."""
+
+    def test_drops_copy_and_cut_headers(self):
+        self.assertEqual(self.pc.normalize_uri(b"copy\nfile:///a.png\n"), b"file:///a.png\n")
+        self.assertEqual(self.pc.normalize_uri(b"cut\nfile:///a.png\n"), b"file:///a.png\n")
+
+    def test_rewrites_bare_absolute_paths(self):
+        self.assertEqual(self.pc.normalize_uri(b"/tmp/a.png\n"), b"file:///tmp/a.png\n")
+
+    def test_keeps_multiple_lines(self):
+        self.assertEqual(self.pc.normalize_uri(b"/a\n/b\n"), b"file:///a\nfile:///b\n")
+
+    def test_keeps_non_file_urls(self):
+        self.assertEqual(self.pc.normalize_uri(b"https://x/y\n"), b"https://x/y\n")
+
+    def test_empty_or_header_only_is_empty(self):
+        self.assertEqual(self.pc.normalize_uri(b""), b"")
+        self.assertEqual(self.pc.normalize_uri(b"copy\n"), b"")
+
+
+class MissingToolsTest(PyclipsyncTest):
+    """Unit tests for the startup helper check (main() stays thin)."""
+
+    def test_reports_only_the_missing_tools(self):
+        def which(tool):
+            return None if tool == "xclip" else f"/bin/{tool}"
+
+        with patch.object(self.pc.shutil, "which", side_effect=which):
+            self.assertEqual(self.pc._missing_tools(), ["xclip"])
+
+    def test_empty_when_everything_is_present(self):
+        with patch.object(self.pc.shutil, "which", return_value="/bin/tool"):
+            self.assertEqual(self.pc._missing_tools(), [])
 
 
 class OwnerLifecycleTest(PyclipsyncTest):
@@ -678,7 +714,7 @@ class SyncerTest(PyclipsyncTest):
         self.syncer = pyclipsync.Syncer()
 
     def state(self, data: bytes, kind: str = "text"):
-        return (kind, data, self.pc.digest(data))
+        return self.pc.State.of(kind, data)
 
     def test_w2x_pushes_and_records_measured_destination(self):
         src = self.state(b"hi")

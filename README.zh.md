@@ -61,6 +61,18 @@ pyclipsync 补的洞：
 
 都在 nixpkgs 里。
 
+## 环境变量
+
+启动时读取一次。值必须是正数，非法值会打一条 warning 并退回默认值。
+
+| 变量                    | 默认值 | 含义                                                         |
+| ----------------------- | ------ | ------------------------------------------------------------ |
+| `DEBUG`                 | 未设置 | 任意值开启 debug 日志（每次读取剪贴板打一行，等等）          |
+| `WATCH_RECYCLE_SECONDS` | `3600` | watcher 子进程多久回收一次，卡死的能自愈                     |
+| `CLIPBOARD_TIMEOUT`     | `3`    | 单次 helper 调用的超时（syncer 锁在此期间持有）              |
+| `IDLE_POLL_SECONDS`     | `60`   | 兜底轮询间隔——漏掉事件时的恢复上限                           |
+| `MISS_LOG_INTERVAL`     | `30`   | "提供了支持的类型但读不出来"这条 warning 的节流间隔         |
+
 ## 使用
 
 用 systemd 用户服务跑（unit 文件见 [`pyclipsync.service`](./pyclipsync.service)）。需要图形会话里的 `DISPLAY` 和 `WAYLAND_DISPLAY`（登录时由 display manager 设好）：

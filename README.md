@@ -95,6 +95,19 @@ pyclipsync adds what they lack:
 
 All are in nixpkgs.
 
+## Environment
+
+Tunables, read once at startup. Values must be a positive number; an invalid
+one logs a warning and falls back to the default.
+
+| variable                | default | meaning                                                                   |
+| ----------------------- | ------- | ------------------------------------------------------------------------- |
+| `DEBUG`                 | unset   | any value enables debug logging (one line per clipboard read, and more)   |
+| `WATCH_RECYCLE_SECONDS` | `3600`  | recycle each watcher child after this long, so a wedged one self-heals    |
+| `CLIPBOARD_TIMEOUT`     | `3`     | timeout for one helper call (the syncer lock is held across it)           |
+| `IDLE_POLL_SECONDS`     | `60`    | backstop poll interval — the recovery bound when a watcher misses an event |
+| `MISS_LOG_INTERVAL`     | `30`    | throttle for the "supported type offered but unreadable" warning          |
+
 ## Usage
 
 Run it as a systemd user service (unit file:

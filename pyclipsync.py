@@ -47,6 +47,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
 log = logging.getLogger("pyclipsync")
 
@@ -379,6 +380,24 @@ def digest(data: bytes | None) -> str:
     return hashlib.sha256(data or b"").hexdigest()
 
 
+@dataclass(frozen=True)
+class State:
+    """One clipboard payload: what it is, its bytes, and a digest for dedup.
+
+    Build it with `State.of` so the digest is always derived from the data
+    (never stale). Frozen because the syncer keeps last_x/last_w around and
+    compares their digests later.
+    """
+
+    kind: str
+    data: bytes
+    digest: str
+
+    @classmethod
+    def of(cls, kind: str, data: bytes) -> State:
+        return cls(kind, data, digest(data))
+
+
 # Read priority per side: (kind, offered types, optional transform), highest
 # first. `transform` normalizes uri payloads (normalize_uri); images and text
 # pass through unchanged. X has two URI spellings: GNOME file copies and QQ
@@ -455,7 +474,7 @@ def _read_state(offered, read, priority):
             if data and transform is not None:
                 data = transform(data)
             if data:
-                return (kind, data, digest(data))
+                return State.of(kind, data)
     return None
 
 
@@ -480,28 +499,26 @@ def w_state():
 
 
 def push_x_to_w(state) -> bool:
-    kind, data, _ = state
-    mime = W_TARGETS.get(kind)
+    mime = W_TARGETS.get(state.kind)
     if mime is None:
-        log.warning("X -> W: unknown kind %s", kind)
+        log.warning("X -> W: unknown kind %s", state.kind)
         return False
-    if not wl_copy(mime, data):
+    if not wl_copy(mime, state.data):
         log.warning("wl-copy %s failed", mime)
         return False
-    log.info("X -> W: synced %s (%d bytes)", kind, len(data))
+    log.info("X -> W: synced %s (%d bytes)", state.kind, len(state.data))
     return True
 
 
 def push_w_to_x(state) -> bool:
-    kind, data, _ = state
-    target = X_TARGETS.get(kind)
+    target = X_TARGETS.get(state.kind)
     if target is None:
-        log.warning("W -> X: unknown kind %s", kind)
+        log.warning("W -> X: unknown kind %s", state.kind)
         return False
-    if not x_set(target, data):
+    if not x_set(target, state.data):
         log.warning("xclip %s failed", target)
         return False
-    log.info("W -> X: synced %s (%d bytes)", kind, len(data))
+    log.info("W -> X: synced %s (%d bytes)", state.kind, len(state.data))
     return True
 
 
@@ -512,7 +529,7 @@ def _destination_after_push(state, readback):
     destination and the readback (which would re-transfer the whole image) is
     skipped. Text may be reshaped by wl-copy, so it is measured.
     """
-    if state[0] in _BYTE_EXACT_KINDS:
+    if state.kind in _BYTE_EXACT_KINDS:
         return state
     return readback() or state
 
@@ -537,12 +554,12 @@ class Syncer:
             if state is None:
                 # empty or unreadable: keep the Wayland side as-is
                 return
-            if state[2] == (self.last_x or ("", b"", ""))[2]:
+            if self.last_x is not None and state.digest == self.last_x.digest:
                 return
-            if state[2] == (self.last_w or ("", b"", ""))[2]:
+            if self.last_w is not None and state.digest == self.last_w.digest:
                 log.debug("X -> W: already in sync, skipping")
                 return
-            log.info("%s: %s", X_LABEL, state[0])
+            log.info("%s: %s", X_LABEL, state.kind)
             if push_x_to_w(state):
                 self.last_x = state
                 self.last_w = _destination_after_push(state, w_state)
@@ -552,12 +569,12 @@ class Syncer:
             state = w_state()
             if state is None:
                 return
-            if state[2] == (self.last_w or ("", b"", ""))[2]:
+            if self.last_w is not None and state.digest == self.last_w.digest:
                 return
-            if state[2] == (self.last_x or ("", b"", ""))[2]:
+            if self.last_x is not None and state.digest == self.last_x.digest:
                 log.debug("W -> X: already in sync, skipping")
                 return
-            log.info("%s: %s", W_LABEL, state[0])
+            log.info("%s: %s", W_LABEL, state.kind)
             if push_w_to_x(state):
                 self.last_w = state
                 self.last_x = _destination_after_push(state, x_state)
@@ -705,6 +722,16 @@ def _handle_shutdown(signum, _frame) -> None:
     _shutdown.set()
 
 
+# Helpers the daemon cannot do without: wl-copy/wl-paste for the Wayland side,
+# xclip for both reading and writing X. clipnotify is not required -- without
+# it X -> W still converges via the backstop poll (with a warning).
+REQUIRED_TOOLS = ("wl-copy", "wl-paste", "xclip")
+
+
+def _missing_tools() -> list[str]:
+    return [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
+
+
 def main():
     logging.basicConfig(
         level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO,
@@ -712,7 +739,7 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    missing = [t for t in ("wl-copy", "wl-paste", "xclip") if shutil.which(t) is None]
+    missing = _missing_tools()
     if missing:
         log.error("missing required clipboard helpers in PATH: %s", " ".join(missing))
         sys.exit(1)
