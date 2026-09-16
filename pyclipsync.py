@@ -90,6 +90,11 @@ W_HTML = "text/html"
 W_URI = "text/uri-list"
 W_TEXT_TYPES = (W_TEXT_UTF8, W_TEXT)
 
+# Human-readable side names, shared by the info logs and the unreadable-offer
+# diagnostic so each string lives in one place.
+X_LABEL = "X11 clipboard"
+W_LABEL = "Wayland clipboard"
+
 # kind -> target/mime per direction (uri-list always maps to text/uri-list on
 # both sides; that is what WeChat and QQ read for pasted file/image links)
 W_TARGETS = {
@@ -432,12 +437,13 @@ def _log_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
     )
 
 
-def _read_state(offered, read, priority, supported, label):
+def _read_state(offered, read, priority):
     """Return (kind, data, digest) for the highest-priority readable offer.
 
     `priority` is a side's (kind, types, transform) table; see X_PRIORITY.
     Reading is best-effort, so a candidate that cannot be read is skipped and
-    the next one is tried; if a supported type stays unreadable, warn once.
+    the next one is tried. Pure: the caller owns the side identity and the
+    unreadable-offer diagnostic.
     """
     if not offered or offered == {"TARGETS"}:
         return None
@@ -450,7 +456,6 @@ def _read_state(offered, read, priority, supported, label):
                 data = transform(data)
             if data:
                 return (kind, data, digest(data))
-    _log_unreadable(label, offered, supported)
     return None
 
 
@@ -458,14 +463,20 @@ def x_state():
     """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
     targets = x_targets()
     log.debug("read X: %d targets", len(targets))
-    return _read_state(targets, x_read, X_PRIORITY, X_SUPPORTED, "X11 clipboard")
+    state = _read_state(targets, x_read, X_PRIORITY)
+    if state is None:
+        _log_unreadable(X_LABEL, targets, X_SUPPORTED)
+    return state
 
 
 def w_state():
     """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
     types = wl_types()
     log.debug("read W: %d types", len(types))
-    return _read_state(types, wl_read, W_PRIORITY, W_SUPPORTED, "Wayland clipboard")
+    state = _read_state(types, wl_read, W_PRIORITY)
+    if state is None:
+        _log_unreadable(W_LABEL, types, W_SUPPORTED)
+    return state
 
 
 def push_x_to_w(state) -> bool:
@@ -531,7 +542,7 @@ class Syncer:
             if state[2] == (self.last_w or ("", b"", ""))[2]:
                 log.debug("X -> W: already in sync, skipping")
                 return
-            log.info("X11 clipboard: %s", state[0])
+            log.info("%s: %s", X_LABEL, state[0])
             if push_x_to_w(state):
                 self.last_x = state
                 self.last_w = _destination_after_push(state, w_state)
@@ -546,7 +557,7 @@ class Syncer:
             if state[2] == (self.last_x or ("", b"", ""))[2]:
                 log.debug("W -> X: already in sync, skipping")
                 return
-            log.info("Wayland clipboard: %s", state[0])
+            log.info("%s: %s", W_LABEL, state[0])
             if push_w_to_x(state):
                 self.last_w = state
                 self.last_x = _destination_after_push(state, x_state)
