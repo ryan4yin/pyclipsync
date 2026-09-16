@@ -406,6 +406,9 @@ class ReadRetryTest(PyclipsyncTest):
     def priority(self):
         return (self.pc._Priority("text", ("UTF8_STRING",)),)
 
+    def supported(self):
+        return {"UTF8_STRING"}
+
     def test_retries_then_succeeds(self):
         seen = []
 
@@ -415,7 +418,7 @@ class ReadRetryTest(PyclipsyncTest):
 
         with patch.object(self.pc.time, "sleep"):
             state = self.pc._read_state(
-                {"UTF8_STRING"}, read, self.priority()
+                {"UTF8_STRING"}, read, self.priority(), self.supported()
             )
         self.assertIsNotNone(state)
         self.assertEqual(state.data, b"hello")
@@ -429,7 +432,7 @@ class ReadRetryTest(PyclipsyncTest):
 
         with patch.object(self.pc.time, "sleep") as sleep:
             state = self.pc._read_state(
-                {"UTF8_STRING"}, read, self.priority()
+                {"UTF8_STRING"}, read, self.priority(), self.supported()
             )
         self.assertIsNone(state)
         self.assertEqual(len(seen), 1 + self.pc.READ_RETRIES)
@@ -442,21 +445,20 @@ class ReadRetryTest(PyclipsyncTest):
             ],
         )
 
-    def test_no_retry_for_unsupported_offers(self):
+    def test_no_retry_when_nothing_relevant_is_offered(self):
         seen = []
 
         def read(mime):
             seen.append(mime)
             return None
 
-        with patch.object(self.pc.time, "sleep") as sleep:
-            state = self.pc._read_state(
-                {"application/x-foo"}, read, self.priority()
-            )
-        self.assertIsNone(state)
-        self.assertEqual(seen, [])
-        sleep.assert_not_called()
-        sleep.assert_not_called()
+        for offered in (set(), {"TARGETS"}, {"application/x-foo"}):
+            with patch.object(self.pc.time, "sleep") as sleep:
+                self.assertIsNone(
+                    self.pc._read_state(offered, read, self.priority(), self.supported())
+                )
+            self.assertEqual(seen, [])
+            sleep.assert_not_called()
 
 
 class WatchRecycleTest(PyclipsyncTest):

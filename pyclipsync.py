@@ -451,15 +451,15 @@ def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
         )
 
 
-def _read_state(offered, read, priority):
+def _read_state(offered, read, priority, supported):
     """Return the highest-priority readable State, or None.
 
     Reading is best-effort: an unreadable candidate is skipped and the next
     one is tried. An owner can be briefly unresponsive right after a copy, so a
-    read that finds an offered type but no data is retried a couple of times
+    read of an offered type that comes back empty is retried a couple of times
     with exponential backoff; an offer with no type we handle is not retried.
     """
-    if not any(mime in offered for entry in priority for mime in entry.types):
+    if not offered & supported:
         return None
     delay = READ_RETRY_DELAY_SECONDS
     for attempt in range(READ_RETRIES + 1):
@@ -482,7 +482,7 @@ def x_state():
     """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
     targets = x_targets()
     log.debug("read X: %d targets", len(targets))
-    state = _read_state(targets, x_read, X_PRIORITY)
+    state = _read_state(targets, x_read, X_PRIORITY, X_SUPPORTED)
     if state is None:
         _warn_unreadable(X_LABEL, targets, X_SUPPORTED)
     return state
@@ -492,7 +492,7 @@ def w_state():
     """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
     types = wl_types()
     log.debug("read W: %d types", len(types))
-    state = _read_state(types, wl_read, W_PRIORITY)
+    state = _read_state(types, wl_read, W_PRIORITY, W_SUPPORTED)
     if state is None:
         _warn_unreadable(W_LABEL, types, W_SUPPORTED)
     return state
