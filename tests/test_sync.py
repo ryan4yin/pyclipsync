@@ -400,6 +400,67 @@ class UnreadableOfferTest(PyclipsyncTest):
             )
 
 
+class ReadRetryTest(PyclipsyncTest):
+    """A supported offer that reads empty is retried before giving up."""
+
+    def priority(self):
+        return (self.pc._Priority("text", ("UTF8_STRING",)),)
+
+    def supported(self):
+        return {"UTF8_STRING"}
+
+    def test_retries_then_succeeds(self):
+        seen = []
+
+        def read(mime):
+            seen.append(mime)
+            return None if len(seen) < 2 else b"hello"
+
+        with patch.object(self.pc.time, "sleep"):
+            state = self.pc._read_state(
+                {"UTF8_STRING"}, read, self.priority(), self.supported()
+            )
+        self.assertIsNotNone(state)
+        self.assertEqual(state.data, b"hello")
+
+    def test_gives_up_after_the_retry_budget(self):
+        seen = []
+
+        def read(mime):
+            seen.append(mime)
+            return None
+
+        with patch.object(self.pc.time, "sleep") as sleep:
+            state = self.pc._read_state(
+                {"UTF8_STRING"}, read, self.priority(), self.supported()
+            )
+        self.assertIsNone(state)
+        self.assertEqual(len(seen), 1 + self.pc.READ_RETRIES)
+        # Backs off exponentially between attempts.
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [
+                self.pc.READ_RETRY_DELAY_SECONDS * 2**i
+                for i in range(self.pc.READ_RETRIES)
+            ],
+        )
+
+    def test_no_retry_when_nothing_relevant_is_offered(self):
+        seen = []
+
+        def read(mime):
+            seen.append(mime)
+            return None
+
+        for offered in (set(), {"TARGETS"}, {"application/x-foo"}):
+            with patch.object(self.pc.time, "sleep") as sleep:
+                self.assertIsNone(
+                    self.pc._read_state(offered, read, self.priority(), self.supported())
+                )
+            self.assertEqual(seen, [])
+            sleep.assert_not_called()
+
+
 class WatchRecycleTest(PyclipsyncTest):
     """Unit tests for the watcher recycle helper (no live session needed)."""
 
@@ -609,7 +670,7 @@ class OwnerLifecycleTest(PyclipsyncTest):
             self.assertEqual(len(self.procs._owners), 1)
 
     def test_spawn_owner_timeout_is_not_recorded(self):
-        with patch.object(self.pc, "CLIPBOARD_TIMEOUT", 0.2), patch.object(
+        with patch.object(self.pc, "CLIPBOARD_TIMEOUT_SECONDS", 0.2), patch.object(
             self.pc.log, "warning"
         ):
             self.assertFalse(
