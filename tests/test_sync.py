@@ -573,11 +573,27 @@ class ImageOverUriPriorityTest(PyclipsyncTest):
     def test_x_state_falls_back_to_uri_without_an_image(self):
         with patch.object(
             self.pc, "x_targets", return_value={self.pc.X_GNOME_FILES}
-        ), patch.object(self.pc, "x_read", return_value=b"copy\nfile:///tmp/x.png\n"):
+        ), patch.object(
+            self.pc, "x_read", return_value=b"copy\nfile:///tmp/x.png\n"
+        ), patch.object(self.pc.time, "sleep"):
             state = self.pc.x_state()
         self.assertIsNotNone(state)
         self.assertEqual(state.kind, "uri")
         self.assertEqual(state.data, b"file:///tmp/x.png\n")
+
+    def test_x_state_rechecks_and_prefers_a_late_image(self):
+        # First read offers only the URI; a later read exposes image/png.
+        targets = [{self.pc.X_URI}, {self.pc.X_PNG}]
+
+        def read(mime):
+            return b"file:///tmp/x.png\n" if mime == self.pc.X_URI else b"\x89PNG"
+
+        with patch.object(self.pc, "x_targets", side_effect=targets), patch.object(
+            self.pc, "x_read", side_effect=read
+        ), patch.object(self.pc.time, "sleep"):
+            state = self.pc.x_state()
+        self.assertEqual(state.kind, "png")
+        self.assertEqual(state.data, b"\x89PNG")
 
     def test_w_state_prefers_png_over_uri(self):
         with patch.object(

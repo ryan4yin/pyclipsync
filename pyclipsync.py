@@ -125,9 +125,14 @@ _BYTE_EXACT_KINDS = frozenset({"png", "jpeg"})
 WATCH_RECYCLE_SECONDS = _env_seconds("WATCH_RECYCLE_SECONDS", 3600.0)
 
 # Timeout for a single clipboard helper call. The syncer lock is held across
-# these calls, so a hung helper stalls both directions; keep it short so the
-# stall is bounded (a read that times out also trips the unreadable-offer log).
-CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT_SECONDS", 3.0)
+# these calls, so a hung helper stalls both directions. It is 6s rather than 3s
+# because a selection owner can be momentarily busy right after a copy: WeChat
+# (Qt/X11), for instance, can take over a second to answer a background xclip
+# read of a large image. With a shorter timeout the offered type looks
+# unreadable, the sync is skipped, and -- because nothing is recorded -- the
+# same payload is read and retried on every later event. A read that still
+# times out trips the unreadable-offer log.
+CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT_SECONDS", 6.0)
 
 # Backstop interval. The watchers are the primary trigger and fire on every
 # change, so this poll only exists to recover the rare event they miss (a
@@ -141,6 +146,16 @@ IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 # exponentially (READ_RETRY_DELAY_SECONDS, doubling).
 READ_RETRIES = 2
 READ_RETRY_DELAY_SECONDS = 0.18
+
+# When the clipboard is only a file URI, the owner (WeChat on X11) may expose
+# the image bytes a moment later: it can offer text/uri-list first and add
+# image/png after the file is ready. Re-list the offered types and re-read a
+# couple of times before settling for the URI, waiting URI_RECHECK_SECONDS and
+# doubling. Image bytes paste anywhere, while the URI points into the sender's
+# namespace (e.g. WeChat's /home/ryan/xwechat_files, which does not exist on the
+# host) and only apps that can resolve it can use it.
+IMAGE_KINDS = frozenset({"png", "jpeg"})
+URI_RECHECK_SECONDS = 0.5
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
@@ -485,11 +500,34 @@ def _read_state(offered, read, priority, supported):
     return None
 
 
+def _read_state_preferring_image(list_types, read, priority, supported):
+    """`_read_state`, but re-check when the only thing readable is a file URI.
+
+    An owner can offer text/uri-list before the image bytes are ready; re-list
+    the offered types and re-read a couple of times before settling for the URI
+    (see URI_RECHECK_SECONDS). Returns (offered, state).
+    """
+    offered = list_types()
+    state = _read_state(offered, read, priority, supported)
+    if state is None or state.kind != "uri":
+        return offered, state
+    delay = URI_RECHECK_SECONDS
+    for _ in range(READ_RETRIES):
+        time.sleep(delay)
+        delay *= 2
+        offered = list_types()
+        better = _read_state(offered, read, priority, supported)
+        if better is not None and better.kind in IMAGE_KINDS:
+            return offered, better
+    return offered, state
+
+
 def x_state():
     """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
-    targets = x_targets()
+    targets, state = _read_state_preferring_image(
+        x_targets, x_read, X_PRIORITY, X_SUPPORTED
+    )
     log.debug("read X: %d targets", len(targets))
-    state = _read_state(targets, x_read, X_PRIORITY, X_SUPPORTED)
     if state is None:
         _warn_unreadable(X_LABEL, targets, X_SUPPORTED)
     return state
@@ -497,9 +535,10 @@ def x_state():
 
 def w_state():
     """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
-    types = wl_types()
+    types, state = _read_state_preferring_image(
+        wl_types, wl_read, W_PRIORITY, W_SUPPORTED
+    )
     log.debug("read W: %d types", len(types))
-    state = _read_state(types, wl_read, W_PRIORITY, W_SUPPORTED)
     if state is None:
         _warn_unreadable(W_LABEL, types, W_SUPPORTED)
     return state
