@@ -414,7 +414,7 @@ class ReadRetryTest(PyclipsyncTest):
             return None if len(seen) < 2 else b"hello"
 
         with patch.object(self.pc.time, "sleep"):
-            state = self.pc._read_state_with_retry(
+            state = self.pc._read_state(
                 {"UTF8_STRING"}, read, self.priority()
             )
         self.assertIsNotNone(state)
@@ -428,7 +428,7 @@ class ReadRetryTest(PyclipsyncTest):
             return None
 
         with patch.object(self.pc.time, "sleep") as sleep:
-            state = self.pc._read_state_with_retry(
+            state = self.pc._read_state(
                 {"UTF8_STRING"}, read, self.priority()
             )
         self.assertIsNone(state)
@@ -450,7 +450,7 @@ class ReadRetryTest(PyclipsyncTest):
             return None
 
         with patch.object(self.pc.time, "sleep") as sleep:
-            state = self.pc._read_state_with_retry(
+            state = self.pc._read_state(
                 {"application/x-foo"}, read, self.priority()
             )
         self.assertIsNone(state)
@@ -668,7 +668,7 @@ class OwnerLifecycleTest(PyclipsyncTest):
             self.assertEqual(len(self.procs._owners), 1)
 
     def test_spawn_owner_timeout_is_not_recorded(self):
-        with patch.object(self.pc, "CLIPBOARD_TIMEOUT", 0.2), patch.object(
+        with patch.object(self.pc, "CLIPBOARD_TIMEOUT_SECONDS", 0.2), patch.object(
             self.pc.log, "warning"
         ):
             self.assertFalse(

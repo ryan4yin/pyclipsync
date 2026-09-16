@@ -127,7 +127,7 @@ WATCH_RECYCLE_SECONDS = _env_seconds("WATCH_RECYCLE_SECONDS", 3600.0)
 # Timeout for a single clipboard helper call. The syncer lock is held across
 # these calls, so a hung helper stalls both directions; keep it short so the
 # stall is bounded (a read that times out also trips the unreadable-offer log).
-CLIPBOARD_TIMEOUT = _env_seconds("CLIPBOARD_TIMEOUT", 3.0)
+CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT", 3.0)
 
 # Backstop interval. The watchers are the primary trigger and fire on every
 # change, so this poll only exists to recover the rare event they miss (a
@@ -144,14 +144,14 @@ READ_RETRY_DELAY_SECONDS = 0.18
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
-# `delay`, which doubles up to WATCH_BACKOFF_MAX; a run that lasted at least
-# WATCH_BACKOFF_MAX (e.g. a clean recycle) resets the backoff.
-WATCH_BACKOFF_MIN = 0.2
-WATCH_BACKOFF_MAX = 30.0
+# `delay`, which doubles up to WATCH_BACKOFF_MAX_SECONDS; a run that lasted at
+# least that (e.g. a clean recycle) resets the backoff.
+WATCH_BACKOFF_MIN_SECONDS = 0.2
+WATCH_BACKOFF_MAX_SECONDS = 30.0
 
 # ---- Helper processes & clipboard IO -----------------------------------------
 
-def run(cmd: list[str], data: bytes | None = None, timeout: float = CLIPBOARD_TIMEOUT):
+def run(cmd: list[str], data: bytes | None = None, timeout: float = CLIPBOARD_TIMEOUT_SECONDS):
     """Run a command. Returns (returncode, stdout). Never raises."""
     try:
         r = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
@@ -253,14 +253,14 @@ class _ProcPool:
             log.debug("%s failed: %s", cmd[0], e)
             return False
         try:
-            p.communicate(input=data, timeout=CLIPBOARD_TIMEOUT)
+            p.communicate(input=data, timeout=CLIPBOARD_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             # Kill the whole group: the direct child may already have forked the
             # owner child that holds the selection.
             self._kill_group(p.pid, signal.SIGKILL)
             p.kill()
             p.communicate()
-            log.warning("%s did not return within %ss", cmd[0], CLIPBOARD_TIMEOUT)
+            log.warning("%s did not return within %ss", cmd[0], CLIPBOARD_TIMEOUT_SECONDS)
             return False
         if p.returncode != 0:
             log.debug("%s exited with %s", cmd[0], p.returncode)
@@ -454,43 +454,27 @@ def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
 def _read_state(offered, read, priority):
     """Return the highest-priority readable State, or None.
 
-    Reading is best-effort, so an unreadable candidate is skipped and the next
-    one is tried.
+    Reading is best-effort: an unreadable candidate is skipped and the next
+    one is tried. An owner can be briefly unresponsive right after a copy, so a
+    read that finds an offered type but no data is retried a couple of times
+    with exponential backoff; an offer with no type we handle is not retried.
     """
-    if not offered or offered == {"TARGETS"}:
+    if not any(mime in offered for entry in priority for mime in entry.types):
         return None
-    for entry in priority:
-        for mime in entry.types:
-            if mime not in offered:
-                continue
-            data = read(mime)
-            if data and entry.transform is not None:
-                data = entry.transform(data)
-            if data:
-                return State.of(entry.kind, data)
-    return None
-
-
-def _read_state_with_retry(offered, read, priority):
-    """`_read_state` with a couple of quick retries while a priority type is
-    offered but comes back empty.
-
-    An owner that just took the selection may not answer a background reader
-    for a moment, so one empty read is not conclusive. Retries with exponential
-    backoff, but only when a priority type was offered, so an empty clipboard
-    or an unrelated MIME costs nothing.
-    """
-    relevant = any(mime in offered for entry in priority for mime in entry.types)
     delay = READ_RETRY_DELAY_SECONDS
     for attempt in range(READ_RETRIES + 1):
         if attempt:
-            if not relevant:
-                break
             time.sleep(delay)
             delay *= 2
-        state = _read_state(offered, read, priority)
-        if state is not None:
-            return state
+        for entry in priority:
+            for mime in entry.types:
+                if mime not in offered:
+                    continue
+                data = read(mime)
+                if data and entry.transform is not None:
+                    data = entry.transform(data)
+                if data:
+                    return State.of(entry.kind, data)
     return None
 
 
@@ -498,7 +482,7 @@ def x_state():
     """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
     targets = x_targets()
     log.debug("read X: %d targets", len(targets))
-    state = _read_state_with_retry(targets, x_read, X_PRIORITY)
+    state = _read_state(targets, x_read, X_PRIORITY)
     if state is None:
         _warn_unreadable(X_LABEL, targets, X_SUPPORTED)
     return state
@@ -508,7 +492,7 @@ def w_state():
     """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
     types = wl_types()
     log.debug("read W: %d types", len(types))
-    state = _read_state_with_retry(types, wl_read, W_PRIORITY)
+    state = _read_state(types, wl_read, W_PRIORITY)
     if state is None:
         _warn_unreadable(W_LABEL, types, W_SUPPORTED)
     return state
@@ -610,7 +594,7 @@ def _watch_loop(run_once, name: str) -> None:
     kept failing. A watcher must never die silently either, so a failure is
     retried with capped backoff rather than escaping the loop.
     """
-    delay = WATCH_BACKOFF_MIN
+    delay = WATCH_BACKOFF_MIN_SECONDS
     while not _shutdown.is_set():
         try:
             healthy = run_once()
@@ -618,10 +602,10 @@ def _watch_loop(run_once, name: str) -> None:
             log.exception("%s failed", name)
             healthy = False
         if healthy:
-            delay = WATCH_BACKOFF_MIN
+            delay = WATCH_BACKOFF_MIN_SECONDS
             continue
         time.sleep(delay)
-        delay = min(delay * 2, WATCH_BACKOFF_MAX)
+        delay = min(delay * 2, WATCH_BACKOFF_MAX_SECONDS)
 
 
 def watch_clipnotify(syncer: Syncer):
