@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -679,6 +680,55 @@ class SyncerTest(unittest.TestCase):
         ) as push:
             self.syncer.on_x_change()
         push.assert_not_called()
+
+    def test_x2w_binary_skips_destination_readback(self):
+        """Binary mimes survive wl-copy byte-exact, so no readback is needed."""
+        src = self.state(b"\x89PNG-bytes", "png")
+        with patch.object(self.pc, "x_state", return_value=src), patch.object(
+            self.pc, "push_x_to_w", return_value=True
+        ), patch.object(self.pc, "w_state") as readback:
+            self.syncer.on_x_change()
+        readback.assert_not_called()
+        self.assertEqual(self.syncer.last_x, src)
+        self.assertEqual(self.syncer.last_w, src)
+
+    def test_w2x_binary_skips_destination_readback(self):
+        src = self.state(b"\x89PNG-bytes", "png")
+        with patch.object(self.pc, "w_state", return_value=src), patch.object(
+            self.pc, "push_w_to_x", return_value=True
+        ), patch.object(self.pc, "x_state") as readback:
+            self.syncer.on_w_change()
+        readback.assert_not_called()
+        self.assertEqual(self.syncer.last_w, src)
+        self.assertEqual(self.syncer.last_x, src)
+
+
+class PollBackstopTest(unittest.TestCase):
+    """The backstop poll reads both sides, starting immediately."""
+
+    def setUp(self) -> None:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import pyclipsync
+
+        self.pc = pyclipsync
+
+    def test_reads_both_sides(self):
+        calls = []
+
+        class FakeSyncer:
+            def on_x_change(self):
+                calls.append("x")
+
+            def on_w_change(self):
+                calls.append("w")
+
+        threading.Thread(
+            target=self.pc.watch_poll, args=(FakeSyncer(), 0.05), daemon=True
+        ).start()
+        time.sleep(0.2)
+        self.assertIn("x", calls)
+        self.assertIn("w", calls)
 
 
 if __name__ == "__main__":

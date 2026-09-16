@@ -32,10 +32,15 @@ known gap in the satellite ecosystem
 A small Python orchestrator over the same battle-tested CLI tools as the bash
 tool [clipsync](https://github.com/123hi123/clipsync):
 
-| direction      | watcher                                     | reader     | writer                 |
-| -------------- | ------------------------------------------- | ---------- | ---------------------- |
-| X11 -> Wayland | `clipnotify` relaunch loop + 5s poll        | `xclip`    | `wl-copy`              |
-| Wayland -> X11 | `wl-paste --watch` (one per mime) + 5s poll | `wl-paste` | `xclip` (CLIPBOARD owner) |
+| direction      | watcher                        | reader     | writer                    |
+| -------------- | ------------------------------ | ---------- | ------------------------- |
+| X11 -> Wayland | `clipnotify` relaunch loop     | `xclip`    | `wl-copy`                 |
+| Wayland -> X11 | `wl-paste --watch` (any offer) | `wl-paste` | `xclip` (CLIPBOARD owner) |
+
+The watchers are the primary trigger and fire on every change. A slow per-side
+backstop poll (default 60s) exists only to recover the rare event they miss (a
+wedged watcher, a restart gap, a failed push), so an idle session does not read
+the whole clipboard every few seconds.
 
 Content types, highest priority wins (mapping follows
 [linuxqq-clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)):
@@ -68,8 +73,12 @@ pyclipsync adds what they lack:
 
 - **`text/html` both ways** (QQ rich text)
 - **a real state machine**: per-side sha256 digest, read + dedup + push
-  atomic under one lock, destination recorded from a readback, 5s pollers
-  retrying failed pushes
+  atomic under one lock, destination recorded from a readback (skipped for
+  byte-exact images), watchers on every change with a slow backstop poll
+- **no redundant work**: one `wl-paste --watch` covers every offer (no burst
+  of per-mime events), binary (`image/png`/`image/jpeg`) syncs skip the
+  destination readback, and the backstop is one slow poll rather than a fixed
+  fast one — so a large image is not transferred while nothing is happening
 - **no destructive pushes**: empty or unreadable sources are never
   propagated; unservable targets fall back to the next one
 - **integration-tested end to end** — the bash tools ship no tests: 12
@@ -150,10 +159,10 @@ failure the workdir is kept and the daemon log tail is printed.
 
 The same file also holds unit tests for the internals (unreadable-offer
 diagnostic, watcher recycle/backoff, the syncer state machine, image-over-URI
-priority, owner/watcher cleanup). They need no graphical session, so only the
-integration class skips
-on a headless machine. `nix build` runs them via the package's `checkPhase`,
-and CI runs them on every push.
+priority, binary readback, backstop poll, owner/watcher cleanup). They need no
+graphical session, so only the integration class skips on a headless machine.
+`nix build` runs them via the package's `checkPhase`, and CI runs them on every
+push.
 
 ```sh
 # test the repo's pyclipsync.py

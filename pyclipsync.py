@@ -12,9 +12,11 @@ https://github.com/123hi123/clipsync):
   X11 -> Wayland:     clipnotify exits      -> xclip reads  -> wl-copy
                       (relaunched in a loop, each exit = one selection event)
   Wayland -> X11:     wl-paste --watch fires -> wl-paste reads -> xclip sets
-                      (xclip becomes the CLIPBOARD selection owner)
+                      (one watcher, any offer; xclip becomes the owner)
 
-A per-side "last synced" state machine prevents X -> W -> X loops.
+A per-side "last synced" state machine prevents X -> W -> X loops. The
+watchers are the primary trigger; a slow per-side poll is a backstop for the
+rare event they miss (a wedged watcher, a restart gap, a failed push).
 
 Content types, highest priority wins:
   - png   image/png
@@ -86,8 +88,6 @@ W_JPEG = "image/jpeg"
 W_HTML = "text/html"
 W_URI = "text/uri-list"
 W_TEXT_TYPES = (W_TEXT_UTF8, W_TEXT)
-# one wl-paste --watch thread per offered mime type
-W_WATCH_TYPES = [*W_TEXT_TYPES, W_PNG, W_JPEG, W_HTML, W_URI]
 
 # kind -> target/mime per direction (uri-list always maps to text/uri-list on
 # both sides; that is what WeChat and QQ read for pasted file/image links)
@@ -106,6 +106,12 @@ X_TARGETS = {
     "html": X_HTML,
 }
 
+# Kinds that survive xclip and wl-copy byte-exact (unlike text/*, which wl-copy
+# reshapes with a trailing newline). After a successful push these need no
+# destination readback: the pushed state *is* the destination state, so reading
+# it back would just re-transfer the whole image.
+_BYTE_EXACT_KINDS = frozenset({"png", "jpeg"})
+
 # Types this tool knows how to read. Used only by the diagnostic below, so an
 # unrelated MIME (application/*, primary selection, ...) does not warn.
 W_SUPPORTED = set(W_TEXT_TYPES) | {W_PNG, W_JPEG, W_HTML, W_URI}
@@ -122,9 +128,11 @@ WATCH_RECYCLE_SECONDS = _env_seconds("WATCH_RECYCLE_SECONDS", 3600.0)
 # stall is bounded (a read that times out also trips the unreadable-offer log).
 CLIPBOARD_TIMEOUT = _env_seconds("CLIPBOARD_TIMEOUT", 3.0)
 
-# Poller interval. Watchers are event-driven; the pollers are only a safety net
-# for missed events, so this can be coarse, which keeps idle CPU low.
-POLL_INTERVAL_SECONDS = _env_seconds("POLL_INTERVAL_SECONDS", 5.0)
+# Backstop interval. The watchers are the primary trigger and fire on every
+# change, so this poll only exists to recover the rare event they miss (a
+# wedged watcher, a restart gap, a failed push). Keeping it coarse means an
+# idle session does not read the whole clipboard every few seconds.
+IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
@@ -359,9 +367,9 @@ def h(data: bytes | None) -> str:
     return hashlib.sha256(data or b"").hexdigest()
 
 
-# Throttle for the unreadable-offer diagnostic: the pollers call the state
-# readers continuously, so log at most once per distinct offer set per window
-# instead of flooding the journal.
+# Throttle for the unreadable-offer diagnostic: the state readers run on every
+# event and backstop poll, so log at most once per distinct offer set per
+# window instead of flooding the journal.
 _MISS_LOG_INTERVAL = 30.0
 _miss_log: dict[str, tuple[frozenset[str], float]] = {}
 
@@ -497,6 +505,18 @@ def push_w_to_x(state) -> bool:
     return True
 
 
+def _destination_after_push(state, readback):
+    """State to record for the side that just received a push.
+
+    Binary mimes survive both helpers byte-exact, so the pushed state *is* the
+    destination and the readback (which would re-transfer the whole image) is
+    skipped. Text may be reshaped by wl-copy, so it is measured.
+    """
+    if state[0] in _BYTE_EXACT_KINDS:
+        return state
+    return readback() or state
+
+
 class Syncer:
     def __init__(self):
         self.lock = threading.Lock()
@@ -510,11 +530,8 @@ class Syncer:
         # stale clipboard, then pass a stale dedup check and push old data,
         # which is what causes X -> W -> X echo ping-pong under rapid copies.
         # Bookkeeping (last_*) is only updated once the push succeeds, so a
-        # failed push is retried on the next event/poll instead of stalling.
-        # The destination side is recorded from a readback, not from the
-        # pushed payload: wl-copy does not preserve text byte-exactly (it
-        # appends a trailing newline to piped input), so the measured state
-        # is the only source of truth for future dedup decisions.
+        # failed push is retried on the next event or backstop poll instead of
+        # stalling. See _destination_after_push for the destination state.
         with self.lock:
             state = x_state()
             if state is None:
@@ -528,7 +545,7 @@ class Syncer:
             log.info("X clipboard: %s", state[0])
             if push_x_to_w(state):
                 self.last_x = state
-                self.last_w = w_state() or state
+                self.last_w = _destination_after_push(state, w_state)
 
     def on_w_change(self):
         with self.lock:
@@ -543,7 +560,7 @@ class Syncer:
             log.info("Wayland clipboard: %s", state[0])
             if push_w_to_x(state):
                 self.last_w = state
-                self.last_x = x_state() or state
+                self.last_x = _destination_after_push(state, x_state)
 
 
 def _watch_loop(run_once, name: str) -> None:
@@ -572,9 +589,9 @@ def watch_clipnotify(syncer: Syncer):
     next CLIPBOARD/PRIMARY owner-change event and then exits silently (no
     output, no flags). Its intended usage is a relaunch loop
     (`while clipnotify; do ...; done`), so we do exactly that: every exit
-    means "something changed", and we re-read the X state afterwards.
-    PRIMARY (click-selection) changes also trigger it, but the digest-based
-    dedup in Syncer.on_x_change filters those out.
+    means "something changed", and we re-read the X state. PRIMARY
+    (click-selection) changes also trigger it, but the digest-based dedup in
+    Syncer.on_x_change filters those out.
     """
     clipnotify = shutil.which("clipnotify")
     if clipnotify is None:
@@ -598,41 +615,6 @@ def watch_clipnotify(syncer: Syncer):
         syncer.on_x_change()
 
     _watch_loop(once, "clipnotify")
-
-
-def watch_x_poll(syncer: Syncer, interval: float = POLL_INTERVAL_SECONDS):
-    """X -> W safety net.
-
-    The clipnotify relaunch loop has a small registration gap (between one
-    clipnotify exiting and the next registering its XFixes subscription) in
-    which an X11 owner change can be missed. If that change is the last one,
-    no further event re-triggers the sync and it stalls. Polling the X state
-    periodically guarantees convergence; on_x_change is digest-deduped so the
-    extra reads are cheap no-ops when nothing changed.
-    """
-    while True:
-        time.sleep(interval)
-        try:
-            syncer.on_x_change()
-        except Exception:  # noqa: BLE001 - never let the poller die
-            log.exception("x poll failed")
-
-
-def watch_w_poll(syncer: Syncer, interval: float = POLL_INTERVAL_SECONDS):
-    """W -> X safety net, symmetric to watch_x_poll.
-
-    wl-paste --watch only fires on *new* offers; if a W -> X push fails
-    (e.g. xclip transiently unavailable) there is no further W event to
-    trigger a retry, so the sync would stall until the user copies again.
-    Polling the Wayland state guarantees convergence; on_w_change is
-    digest-deduped so the extra reads are cheap no-ops when nothing changed.
-    """
-    while True:
-        time.sleep(interval)
-        try:
-            syncer.on_w_change()
-        except Exception:  # noqa: BLE001 - never let the poller die
-            log.exception("w poll failed")
 
 
 def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
@@ -659,28 +641,44 @@ def _watch_once(cmd: list[str], on_event, recycle: float) -> None:
                 _terminate_proc(p)
 
 
-def watch_wayland(syncer: Syncer, mime: str):
-    """W -> X: forward each Wayland clipboard offer of the given mime type.
+def watch_wayland(syncer: Syncer):
+    """W -> X: forward each Wayland selection change.
 
-    wl-paste --watch takes exactly one command (exec'ed as-is, no shell):
-    it runs it with the offer data on stdin whenever a new offer containing
-    the given type appears. We use bare `echo`, which ignores stdin and
-    prints a single newline per offer -- a pure change signal. We re-read
-    the full state afterwards.
+    `wl-paste --watch echo` runs `echo` on every selection change (echo
+    ignores stdin and prints one newline -- a pure change signal); with no
+    --type, wl-paste falls back to any offered type, so a single watcher
+    covers every offer instead of one watcher per mime type. We re-read the
+    full state afterwards.
 
     The watch child is recycled every WATCH_RECYCLE_SECONDS (see _watch_once)
-    so a wedged watcher cannot silently stall W -> X sync; an offer missed in
-    the brief restart gap is caught by watch_w_poll.
+    so a wedged watcher cannot silently stall W -> X sync.
     """
-    cmd = ["wl-paste", "--type", mime, "--watch", "echo"]
-
-    def on_event() -> None:
-        log.debug("watch %s: new offer", mime)
-        syncer.on_w_change()
-
     _watch_loop(
-        lambda: _watch_once(cmd, on_event, WATCH_RECYCLE_SECONDS), f"watch {mime}"
+        lambda: _watch_once(
+            ["wl-paste", "--watch", "echo"],
+            syncer.on_w_change,
+            WATCH_RECYCLE_SECONDS,
+        ),
+        "wl-paste --watch",
     )
+
+
+def watch_poll(syncer: Syncer, interval: float = IDLE_POLL_SECONDS):
+    """Slow backstop for the events the watchers miss.
+
+    The watchers fire on every change, so this is only a safety net: a wedged
+    watcher (until its recycle), the small registration gap when a watcher
+    restarts, or a push that failed with no later event to retry it. Reading
+    first syncs whatever is already on the clipboards at startup. on_*_change
+    is digest-deduped, so a poll with nothing changed is a cheap no-op.
+    """
+    while not _shutdown.is_set():
+        try:
+            syncer.on_x_change()
+            syncer.on_w_change()
+        except Exception:  # noqa: BLE001 - the poller must never die
+            log.exception("fallback poll failed")
+        time.sleep(interval)
 
 
 _shutdown = threading.Event()
@@ -710,21 +708,11 @@ def main():
         target=watch_clipnotify, args=(syncer,), daemon=True, name="x2w"
     ).start()
     threading.Thread(
-        target=watch_x_poll,
-        args=(syncer, POLL_INTERVAL_SECONDS),
-        daemon=True,
-        name="x2w-poll",
+        target=watch_wayland, args=(syncer,), daemon=True, name="w2x"
     ).start()
     threading.Thread(
-        target=watch_w_poll,
-        args=(syncer, POLL_INTERVAL_SECONDS),
-        daemon=True,
-        name="w2x-poll",
+        target=watch_poll, args=(syncer,), daemon=True, name="backstop"
     ).start()
-    for mime in W_WATCH_TYPES:
-        threading.Thread(
-            target=watch_wayland, args=(syncer, mime), daemon=True, name=f"w2x-{mime}"
-        ).start()
 
     log.info(
         "pyclipsync started (DISPLAY=%s, WAYLAND_DISPLAY=%s)",
