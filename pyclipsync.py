@@ -125,9 +125,14 @@ _BYTE_EXACT_KINDS = frozenset({"png", "jpeg"})
 WATCH_RECYCLE_SECONDS = _env_seconds("WATCH_RECYCLE_SECONDS", 3600.0)
 
 # Timeout for a single clipboard helper call. The syncer lock is held across
-# these calls, so a hung helper stalls both directions; keep it short so the
-# stall is bounded (a read that times out also trips the unreadable-offer log).
-CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT_SECONDS", 3.0)
+# these calls, so a hung helper stalls both directions. It is 6s rather than 3s
+# because a selection owner can be momentarily busy right after a copy: WeChat
+# (Qt/X11), for instance, can take over a second to answer a background xclip
+# read of a large image. With a shorter timeout the offered type looks
+# unreadable, the sync is skipped, and -- because nothing is recorded -- the
+# same payload is read and retried on every later event. A read that still
+# times out trips the unreadable-offer log.
+CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT_SECONDS", 6.0)
 
 # Backstop interval. The watchers are the primary trigger and fire on every
 # change, so this poll only exists to recover the rare event they miss (a
@@ -615,6 +620,17 @@ def _watch_loop(run_once, name: str) -> None:
         delay = min(delay * 2, WATCH_BACKOFF_MAX_SECONDS)
 
 
+def _read_async(fn) -> None:
+    """Run a state read off the watcher thread.
+
+    A read can take a while (a retry, or CLIPBOARD_TIMEOUT on a hung owner), so
+    doing it in the watcher thread would delay the watcher's relaunch and widen
+    its registration gap -- changes in that gap are missed. The syncer lock
+    serializes the concurrent reads.
+    """
+    threading.Thread(target=fn, daemon=True).start()
+
+
 def watch_clipnotify(syncer: Syncer):
     """X -> W: forward each X11 selection owner change.
 
@@ -648,7 +664,7 @@ def watch_clipnotify(syncer: Syncer):
         if p.returncode != 0:
             log.warning("clipnotify exited with status %s", p.returncode)
             return False
-        syncer.on_x_change()
+        _read_async(syncer.on_x_change)
         return True
 
     _watch_loop(once, "clipnotify")
@@ -691,16 +707,19 @@ def watch_wayland(syncer: Syncer):
     `wl-paste --watch echo` runs `echo` on every selection change (echo
     ignores stdin and prints one newline -- a pure change signal); with no
     --type, wl-paste falls back to any offered type, so a single watcher
-    covers every offer instead of one watcher per mime type. We re-read the
-    full state afterwards.
+    covers every offer instead of one watcher per mime type. The read runs off
+    this thread (see _read_async), so the watcher keeps consuming offers.
 
     The watch child is recycled every WATCH_RECYCLE_SECONDS (see _watch_once)
     so a wedged watcher cannot silently stall W -> X sync.
     """
+    def on_event() -> None:
+        _read_async(syncer.on_w_change)
+
     _watch_loop(
         lambda: _watch_once(
             ["wl-paste", "--watch", "echo"],
-            syncer.on_w_change,
+            on_event,
             WATCH_RECYCLE_SECONDS,
         ),
         "wl-paste --watch",
