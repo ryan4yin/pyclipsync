@@ -417,8 +417,8 @@ class ReadRetryTest(PyclipsyncTest):
             return None if len(seen) < 2 else b"hello"
 
         with patch.object(self.pc.time, "sleep"):
-            state = self.pc._read_state(
-                {"UTF8_STRING"}, read, self.priority(), self.supported()
+            _, state = self.pc._read_state(
+                lambda: {"UTF8_STRING"}, read, self.priority(), self.supported()
             )
         self.assertIsNotNone(state)
         self.assertEqual(state.data, b"hello")
@@ -431,8 +431,8 @@ class ReadRetryTest(PyclipsyncTest):
             return None
 
         with patch.object(self.pc.time, "sleep") as sleep:
-            state = self.pc._read_state(
-                {"UTF8_STRING"}, read, self.priority(), self.supported()
+            _, state = self.pc._read_state(
+                lambda: {"UTF8_STRING"}, read, self.priority(), self.supported()
             )
         self.assertIsNone(state)
         self.assertEqual(len(seen), 1 + self.pc.READ_RETRIES)
@@ -454,9 +454,10 @@ class ReadRetryTest(PyclipsyncTest):
 
         for offered in (set(), {"TARGETS"}, {"application/x-foo"}):
             with patch.object(self.pc.time, "sleep") as sleep:
-                self.assertIsNone(
-                    self.pc._read_state(offered, read, self.priority(), self.supported())
+                _, state = self.pc._read_state(
+                    lambda o=offered: o, read, self.priority(), self.supported()
                 )
+            self.assertIsNone(state)
             self.assertEqual(seen, [])
             sleep.assert_not_called()
 

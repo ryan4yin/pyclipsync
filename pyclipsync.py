@@ -140,22 +140,16 @@ CLIPBOARD_TIMEOUT_SECONDS = _env_seconds("CLIPBOARD_TIMEOUT_SECONDS", 6.0)
 # idle session does not read the whole clipboard every few seconds.
 IDLE_POLL_SECONDS = _env_seconds("IDLE_POLL_SECONDS", 60.0)
 
-# A clipboard owner can be briefly unresponsive right after a copy (observed
-# with WeChat on X11), so one empty read of an offered type is not conclusive.
-# Retry a couple of times before reporting the offer unreadable, backing off
-# exponentially (READ_RETRY_DELAY_SECONDS, doubling).
+# A clipboard owner can be briefly unresponsive right after a copy, and can
+# expose a file URI before the image bytes are ready (both observed with WeChat
+# on X11). A read that comes back empty, or with only a URI, is retried a couple
+# of times -- re-listing the offered types each time, since the image can appear
+# on a later offer -- with exponential backoff (READ_RETRY_DELAY_SECONDS,
+# doubling). The URI points into the sender's namespace (e.g. WeChat's
+# /home/ryan/xwechat_files, which does not exist on the host), while the image
+# bytes paste anywhere, so it is worth waiting for them.
 READ_RETRIES = 2
-READ_RETRY_DELAY_SECONDS = 0.18
-
-# When the clipboard is only a file URI, the owner (WeChat on X11) may expose
-# the image bytes a moment later: it can offer text/uri-list first and add
-# image/png after the file is ready. Re-list the offered types and re-read a
-# couple of times before settling for the URI, waiting URI_RECHECK_SECONDS and
-# doubling. Image bytes paste anywhere, while the URI points into the sender's
-# namespace (e.g. WeChat's /home/ryan/xwechat_files, which does not exist on the
-# host) and only apps that can resolve it can use it.
-IMAGE_KINDS = frozenset({"png", "jpeg"})
-URI_RECHECK_SECONDS = 0.5
+READ_RETRY_DELAY_SECONDS = 0.5
 
 # Watcher retry policy: a watcher loop must survive helper failures without
 # dying (silent stall) or hot-looping (a fast respawn storm). Each failure waits
@@ -466,67 +460,50 @@ def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
         )
 
 
-def _read_state(offered, read, priority, supported):
-    """Return the highest-priority readable State, or None.
-
-    An owner can be briefly unresponsive right after a copy, so a scan that
-    finds an offered type but no data is retried a couple of times with
-    exponential backoff before giving up. An offer with no type we handle is
-    not retried.
-    """
+def _scan(offered, read, priority, supported):
+    """One pass over the priority table; the first readable entry wins."""
     if not offered & supported:
         return None
-
-    def read_once():
-        for entry in priority:
-            for mime in entry.types:
-                if mime not in offered:
-                    continue
-                data = read(mime)
-                if data and entry.transform is not None:
-                    data = entry.transform(data)
-                if data:
-                    return State.of(entry.kind, data)
-        return None
-
-    delay = READ_RETRY_DELAY_SECONDS
-    for attempt in range(READ_RETRIES + 1):
-        if attempt:
-            time.sleep(delay)
-            delay *= 2
-        state = read_once()
-        if state is not None:
-            return state
+    for entry in priority:
+        for mime in entry.types:
+            if mime not in offered:
+                continue
+            data = read(mime)
+            if data and entry.transform is not None:
+                data = entry.transform(data)
+            if data:
+                return State.of(entry.kind, data)
     return None
 
 
-def _read_state_preferring_image(list_types, read, priority, supported):
-    """`_read_state`, but re-check when the only thing readable is a file URI.
+def _read_state(list_types, read, priority, supported):
+    """Read the clipboard, retrying while the result is not final.
 
-    An owner can offer text/uri-list before the image bytes are ready; re-list
-    the offered types and re-read a couple of times before settling for the URI
-    (see URI_RECHECK_SECONDS). Returns (offered, state).
+    A read is retried when it comes back empty (the owner has not answered yet)
+    or with only a file URI (the owner exposed a link before the image bytes --
+    WeChat does this), because image bytes paste anywhere while the URI points
+    into the sender's namespace. Anything else ends the retries, and an offer
+    with no type we handle is never retried. Each retry re-lists the offered
+    types, since the image can appear on a later offer. Returns (offered, state).
     """
     offered = list_types()
-    state = _read_state(offered, read, priority, supported)
-    if state is None or state.kind != "uri":
-        return offered, state
-    delay = URI_RECHECK_SECONDS
+    state = _scan(offered, read, priority, supported)
+    delay = READ_RETRY_DELAY_SECONDS
     for _ in range(READ_RETRIES):
+        if state is not None and state.kind != "uri":
+            break
+        if not offered & supported:
+            break
         time.sleep(delay)
         delay *= 2
         offered = list_types()
-        better = _read_state(offered, read, priority, supported)
-        if better is not None and better.kind in IMAGE_KINDS:
-            return offered, better
+        state = _scan(offered, read, priority, supported)
     return offered, state
 
 
 def x_state():
     """Read the X11 CLIPBOARD. Priority: X_PRIORITY (see the module docstring)."""
-    targets, state = _read_state_preferring_image(
-        x_targets, x_read, X_PRIORITY, X_SUPPORTED
-    )
+    targets, state = _read_state(x_targets, x_read, X_PRIORITY, X_SUPPORTED)
     log.debug("read X: %d targets", len(targets))
     if state is None:
         _warn_unreadable(X_LABEL, targets, X_SUPPORTED)
@@ -535,9 +512,7 @@ def x_state():
 
 def w_state():
     """Read the Wayland clipboard. Priority: W_PRIORITY (see the module docstring)."""
-    types, state = _read_state_preferring_image(
-        wl_types, wl_read, W_PRIORITY, W_SUPPORTED
-    )
+    types, state = _read_state(wl_types, wl_read, W_PRIORITY, W_SUPPORTED)
     log.debug("read W: %d types", len(types))
     if state is None:
         _warn_unreadable(W_LABEL, types, W_SUPPORTED)
