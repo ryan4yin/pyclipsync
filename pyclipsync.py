@@ -454,18 +454,15 @@ def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
 def _read_state(offered, read, priority, supported):
     """Return the highest-priority readable State, or None.
 
-    Reading is best-effort: an unreadable candidate is skipped and the next
-    one is tried. An owner can be briefly unresponsive right after a copy, so a
-    read of an offered type that comes back empty is retried a couple of times
-    with exponential backoff; an offer with no type we handle is not retried.
+    An owner can be briefly unresponsive right after a copy, so a scan that
+    finds an offered type but no data is retried a couple of times with
+    exponential backoff before giving up. An offer with no type we handle is
+    not retried.
     """
     if not offered & supported:
         return None
-    delay = READ_RETRY_DELAY_SECONDS
-    for attempt in range(READ_RETRIES + 1):
-        if attempt:
-            time.sleep(delay)
-            delay *= 2
+
+    def read_once():
         for entry in priority:
             for mime in entry.types:
                 if mime not in offered:
@@ -475,6 +472,16 @@ def _read_state(offered, read, priority, supported):
                     data = entry.transform(data)
                 if data:
                     return State.of(entry.kind, data)
+        return None
+
+    delay = READ_RETRY_DELAY_SECONDS
+    for attempt in range(READ_RETRIES + 1):
+        if attempt:
+            time.sleep(delay)
+            delay *= 2
+        state = read_once()
+        if state is not None:
+            return state
     return None
 
 
