@@ -424,36 +424,27 @@ X_SUPPORTED = {t for _, types, _ in X_PRIORITY for t in types}
 W_SUPPORTED = {t for _, types, _ in W_PRIORITY for t in types}
 
 
-# Throttle for the unreadable-offer diagnostic: the state readers run on every
-# event and backstop poll, so log at most once per distinct offer set per
-# window instead of flooding the journal.
-_MISS_LOG_INTERVAL = _env_seconds("MISS_LOG_INTERVAL", 30.0)
-_miss_log: dict[str, tuple[frozenset[str], float]] = {}
-
-
-def _log_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
-    """Warn (throttled) when a supported type is offered but cannot be read.
+def _warn_unreadable(side: str, offered: set[str], supported: set[str]) -> None:
+    """Warn when a supported type is offered but cannot be read.
 
     Reading is best-effort: `wl-paste`/`xclip` can return nothing even though
     the selection advertises a type we handle -- e.g. a client that keeps
     selection ownership but refuses to serve a background/data-control reader
     (observed with Chromium on Wayland). Without this the miss is silent: no
     sync happens and no log line says why.
+
+    Logged on every read: in steady state that is at most one per backstop poll
+    (IDLE_POLL_SECONDS, 60s), which is acceptable and shows the problem is still
+    ongoing.
     """
     stuck = offered & supported
-    if not stuck:
-        return
-    now = time.monotonic()
-    prev = _miss_log.get(side)
-    if prev is not None and prev[0] == frozenset(stuck) and now - prev[1] < _MISS_LOG_INTERVAL:
-        return
-    _miss_log[side] = (frozenset(stuck), now)
-    log.warning(
-        "%s: %d supported type(s) offered but unreadable, sync skipped: %s",
-        side,
-        len(stuck),
-        " ".join(sorted(stuck)),
-    )
+    if stuck:
+        log.warning(
+            "%s: %d supported type(s) offered but unreadable, sync skipped: %s",
+            side,
+            len(stuck),
+            " ".join(sorted(stuck)),
+        )
 
 
 def _read_state(offered, read, priority):
@@ -484,7 +475,7 @@ def x_state():
     log.debug("read X: %d targets", len(targets))
     state = _read_state(targets, x_read, X_PRIORITY)
     if state is None:
-        _log_unreadable(X_LABEL, targets, X_SUPPORTED)
+        _warn_unreadable(X_LABEL, targets, X_SUPPORTED)
     return state
 
 
@@ -494,7 +485,7 @@ def w_state():
     log.debug("read W: %d types", len(types))
     state = _read_state(types, wl_read, W_PRIORITY)
     if state is None:
-        _log_unreadable(W_LABEL, types, W_SUPPORTED)
+        _warn_unreadable(W_LABEL, types, W_SUPPORTED)
     return state
 
 
