@@ -37,7 +37,7 @@ in
       };
       Install.WantedBy = [ "graphical-session.target" ];
       Service = {
-        ExecStart = "${pyclipsync.packages.${pkgs.system}.pyclipsync}/bin/pyclipsync";
+        ExecStart = "${pyclipsync.packages.${pkgs.stdenv.hostPlatform.system}.pyclipsync}/bin/pyclipsync";
         Restart = "on-failure";
         RestartSec = 1;
         TimeoutStopSec = 5;
