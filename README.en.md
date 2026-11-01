@@ -2,6 +2,8 @@
 
 **English** | [中文](./README.md)
 
+> **Status (November 2026):** Both QQ and WeChat now support native Wayland. The main problem this project was built to solve is largely gone, so the project is no longer really necessary. It is kept for reference only; it may still be useful if you need to sync images, rich text, or file URIs between XWayland and native Wayland apps.
+
 Wayland <-> X11 clipboard synchronization daemon for Wayland compositors that
 run X11 apps through [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
 (niri, Hyprland, ...).

@@ -2,6 +2,8 @@
 
 [English](./README.en.md) | **中文**
 
+> **状态（2026-11）：** QQ 和微信桌面端现在都已支持原生 Wayland，本项目最初要解决的主要场景基本消失，继续存在和维护的必要性已经很低。仓库仅作参考保留；只有当你仍需在 XWayland 应用与 Wayland 应用之间同步图片、富文本或文件 URI 时才可能用得上。
+
 给 niri、Hyprland 这类通过 [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite) 跑 X11 应用的 Wayland 合成器用的剪贴板同步守护进程，让 Wayland 原生应用和 X11 应用能正常共享剪贴板。
 
 ## 问题
