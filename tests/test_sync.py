@@ -854,6 +854,47 @@ class SyncerTest(PyclipsyncTest):
         self.assertEqual(self.syncer.last_x, src)
 
 
+class CoalescedTest(PyclipsyncTest):
+    """A burst of watcher events costs one extra read, not a thread each."""
+
+    def test_burst_during_a_read_runs_once_more(self):
+        started, release = threading.Event(), threading.Event()
+        calls = []
+
+        def read():
+            calls.append(1)
+            started.set()
+            release.wait(5)
+
+        sync = self.pc._Coalesced(read)
+        sync.trigger()
+        self.assertTrue(started.wait(5))
+        for _ in range(10):
+            sync.trigger()
+        release.set()
+        deadline = time.monotonic() + 5
+        while sync._running and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(sync._running)
+        self.assertEqual(len(calls), 2)
+
+    def test_failed_read_does_not_block_later_triggers(self):
+        calls = []
+
+        def read():
+            calls.append(1)
+            raise RuntimeError("boom")
+
+        sync = self.pc._Coalesced(read)
+        with self.assertLogs("pyclipsync", "ERROR"):
+            for _ in range(2):
+                sync.trigger()
+                deadline = time.monotonic() + 5
+                while sync._running and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        self.assertEqual(len(calls), 2)
+
+
 class PollBackstopTest(PyclipsyncTest):
     """The backstop poll reads both sides, starting immediately."""
 

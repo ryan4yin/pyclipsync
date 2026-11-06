@@ -620,15 +620,41 @@ def _watch_loop(run_once, name: str) -> None:
         delay = min(delay * 2, WATCH_BACKOFF_MAX_SECONDS)
 
 
-def _read_async(fn) -> None:
-    """Run a state read off the watcher thread.
+class _Coalesced:
+    """Run fn off the watcher thread, folding triggers that arrive meanwhile.
 
     A read can take a while (a retry, or CLIPBOARD_TIMEOUT on a hung owner), so
     doing it in the watcher thread would delay the watcher's relaunch and widen
-    its registration gap -- changes in that gap are missed. The syncer lock
-    serializes the concurrent reads.
+    its registration gap -- changes in that gap are missed. Every read sees the
+    latest clipboard, so a burst of events needs one more read after the
+    current one, not a thread per event.
     """
-    threading.Thread(target=fn, daemon=True).start()
+
+    def __init__(self, fn: Callable[[], None]):
+        self._fn = fn
+        self._lock = threading.Lock()
+        self._running = False
+        self._pending = False
+
+    def trigger(self) -> None:
+        with self._lock:
+            if self._running:
+                self._pending = True
+                return
+            self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                self._fn()
+            except Exception:  # noqa: BLE001 - later triggers must still run
+                log.exception("clipboard sync failed")
+            with self._lock:
+                if not self._pending:
+                    self._running = False
+                    return
+                self._pending = False
 
 
 def watch_clipnotify(syncer: Syncer):
@@ -646,6 +672,7 @@ def watch_clipnotify(syncer: Syncer):
     if clipnotify is None:
         log.error("clipnotify not found in PATH; X -> W sync disabled")
         return
+    sync = _Coalesced(syncer.on_x_change)
 
     def once() -> bool:
         p = subprocess.Popen(
@@ -664,7 +691,7 @@ def watch_clipnotify(syncer: Syncer):
         if p.returncode != 0:
             log.warning("clipnotify exited with status %s", p.returncode)
             return False
-        _read_async(syncer.on_x_change)
+        sync.trigger()
         return True
 
     _watch_loop(once, "clipnotify")
@@ -708,18 +735,17 @@ def watch_wayland(syncer: Syncer):
     ignores stdin and prints one newline -- a pure change signal); with no
     --type, wl-paste falls back to any offered type, so a single watcher
     covers every offer instead of one watcher per mime type. The read runs off
-    this thread (see _read_async), so the watcher keeps consuming offers.
+    this thread (see _Coalesced), so the watcher keeps consuming offers.
 
     The watch child is recycled every WATCH_RECYCLE_SECONDS (see _watch_once)
     so a wedged watcher cannot silently stall W -> X sync.
     """
-    def on_event() -> None:
-        _read_async(syncer.on_w_change)
+    sync = _Coalesced(syncer.on_w_change)
 
     _watch_loop(
         lambda: _watch_once(
             ["wl-paste", "--watch", "echo"],
-            on_event,
+            sync.trigger,
             WATCH_RECYCLE_SECONDS,
         ),
         "wl-paste --watch",
