@@ -1,7 +1,7 @@
 # Home-manager module: runs pyclipsync as a systemd user service.
 #
-# Expects the `pyclipsync` module argument to be the flake (output set),
-# e.g. via specialArgs:
+# The flake applies this file to itself (`homeModules.default`), so consumers
+# only need:
 #
 #   inputs.pyclipsync = {
 #     url = "github:ryan4yin/pyclipsync";
@@ -12,19 +12,27 @@
 #     imports = [ inputs.pyclipsync.homeModules.default ];
 #     services.pyclipsync.enable = true;
 #   };
+self:
 {
   config,
   lib,
   pkgs,
-  pyclipsync,
   ...
 }:
 let
   cfg = config.services.pyclipsync;
 in
 {
-  options.services.pyclipsync.enable =
-    lib.mkEnableOption "pyclipsync, the Wayland <-> X11 clipboard sync daemon";
+  options.services.pyclipsync = {
+    enable = lib.mkEnableOption "pyclipsync, the Wayland <-> X11 clipboard sync daemon";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.pyclipsync;
+      defaultText = lib.literalExpression "pyclipsync.packages.\${pkgs.stdenv.hostPlatform.system}.pyclipsync";
+      description = "The pyclipsync package to run.";
+    };
+  };
 
   config = lib.mkIf cfg.enable {
     # Needs DISPLAY + WAYLAND_DISPLAY from the graphical session (provided
@@ -37,7 +45,7 @@ in
       };
       Install.WantedBy = [ "graphical-session.target" ];
       Service = {
-        ExecStart = "${pyclipsync.packages.${pkgs.stdenv.hostPlatform.system}.pyclipsync}/bin/pyclipsync";
+        ExecStart = lib.getExe cfg.package;
         Restart = "on-failure";
         RestartSec = 1;
         TimeoutStopSec = 5;

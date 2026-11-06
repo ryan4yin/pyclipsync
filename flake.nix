@@ -30,7 +30,7 @@
         });
 
       homeModules = {
-        default = import ./nix/home-module.nix;
+        default = import ./nix/home-module.nix self;
       };
     };
 }
