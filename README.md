@@ -118,9 +118,10 @@ home.packages = [ inputs.pyclipsync.packages.${system}.pyclipsync ];
 不用 flake：
 
 ```nix
-{ flake ? (fetchTarball "github:ryan4yin/pyclipsync") }:
-flake.packages.${builtins.currentSystem}.default
+pkgs.callPackage "${fetchTarball "https://github.com/ryan4yin/pyclipsync/archive/main.tar.gz"}/nix/package.nix" { }
 ```
+
+home-manager module 的 `services.pyclipsync.package` 可以换成你自己构建的包。
 
 ## 测试
 

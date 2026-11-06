@@ -163,9 +163,10 @@ home.packages = [ inputs.pyclipsync.packages.${system}.pyclipsync ];
 Without flakes:
 
 ```nix
-{ flake ? (fetchTarball "github:ryan4yin/pyclipsync") }:
-flake.packages.${builtins.currentSystem}.default
+pkgs.callPackage "${fetchTarball "https://github.com/ryan4yin/pyclipsync/archive/main.tar.gz"}/nix/package.nix" { }
 ```
+
+The home-manager module's `services.pyclipsync.package` accepts your own build.
 
 ## Testing
 
