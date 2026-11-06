@@ -2,19 +2,21 @@
 
 **English** | [中文](./README.md)
 
-> **Status (November 2026):** Both QQ and WeChat now support native Wayland. The main problem this project was built to solve is largely gone, so the project is no longer really necessary. It is kept for reference only; it may still be useful if you need to sync images, rich text, or file URIs between XWayland and native Wayland apps.
-
 Wayland <-> X11 clipboard synchronization daemon for Wayland compositors that
 run X11 apps through [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
-(niri, Hyprland, ...).
+(niri, Hyprland, ...), including apps whose window is Wayland but whose
+clipboard is X11, such as Linux QQ.
 
 ## The problem
 
 With xwayland-satellite, X11 apps live in a rootless X server that is *outside*
 the compositor. The satellite does bridge the X11 `CLIPBOARD` selection with
-the Wayland data device in both directions, but the bridge is incomplete and
-fragile, so the result is a clipboard that **works sometimes and not others**:
+the Wayland data device in both directions, but the bridge has gaps:
 
+- The satellite syncs only while one of its X11 windows has **keyboard
+  focus** (Wayland lets only the focused client set the selection). An app
+  whose window is Wayland but whose clipboard is X11, such as Linux QQ in
+  Wayland mode, never gives it focus, so nothing crosses in either direction.
 - X↔Wayland **target/mime translation** drops X-specific targets
   (`x-special/gnome-copied-files`, `application/x-qt-image`, raw
   `UTF8_STRING`) that have no Wayland equivalent.
@@ -24,10 +26,9 @@ fragile, so the result is a clipboard that **works sometimes and not others**:
 - The satellite's **selection tracking can go stale**, so an X11 app may keep
   pasting an older copy.
 
-In practice even plain text is hit or miss, and images, rich text and file
-copies from WeChat/QQ (`QT_QPA_PLATFORM=xcb`) fail most of the time. This is a
-known gap in the satellite ecosystem
-([xwayland-satellite#50](https://github.com/Supreeeme/xwayland-satellite/issues/50)).
+In practice, with WeChat or QQ in X11 mode even plain text is hit or miss,
+and images, rich text and file copies fail most of the time (Wayland -> X11:
+[xwayland-satellite#50](https://github.com/Supreeeme/xwayland-satellite/issues/50)).
 
 ## How it works
 
@@ -38,6 +39,10 @@ tool [clipsync](https://github.com/123hi123/clipsync):
 | -------------- | ------------------------------ | ---------- | ------------------------- |
 | X11 -> Wayland | `clipnotify` relaunch loop     | `xclip`    | `wl-copy`                 |
 | Wayland -> X11 | `wl-paste --watch` (any offer) | `wl-paste` | `xclip` (CLIPBOARD owner) |
+
+Neither direction depends on keyboard focus: `clipnotify` watches the X11
+selection through XFixes, and `wl-clipboard` uses the compositor's
+data-control protocol.
 
 The watchers are the primary trigger and fire on every change. A slow per-side
 backstop poll (default 60s) exists only to recover the rare event they miss (a
