@@ -2,19 +2,18 @@
 
 [English](./README.en.md) | **中文**
 
-> **状态（2026-11）：** QQ 和微信桌面端现在都已支持原生 Wayland，本项目最初要解决的主要场景基本消失，继续存在和维护的必要性已经很低。仓库仅作参考保留；只有当你仍需在 XWayland 应用与 Wayland 应用之间同步图片、富文本或文件 URI 时才可能用得上。
-
-给 niri、Hyprland 这类通过 [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite) 跑 X11 应用的 Wayland 合成器用的剪贴板同步守护进程，让 Wayland 原生应用和 X11 应用能正常共享剪贴板。
+给 niri、Hyprland 这类通过 [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite) 跑 X11 应用的 Wayland 合成器用的剪贴板同步守护进程，让 Wayland 原生应用和 X11 应用能正常共享剪贴板，也适用于窗口走 Wayland、剪贴板仍走 X11 的应用（比如 Linux QQ）。
 
 ## 问题
 
-用 xwayland-satellite 的时候，X11 应用（微信、QQ 这些）跑在合成器外面的一个 rootless X server 里。satellite 其实也做了 X11 `CLIPBOARD` 和 Wayland 剪贴板之间的双向桥接，但做得不完整也不可靠，所以剪贴板**时灵时不灵**：
+用 xwayland-satellite 的时候，X11 应用跑在合成器外面的一个 rootless X server 里。satellite 其实也做了 X11 `CLIPBOARD` 和 Wayland 剪贴板之间的双向桥接，但有几处限制：
 
+- satellite 只在它的 X11 窗口有键盘焦点时才能同步剪贴板（Wayland 协议要求设置剪贴板的客户端持有焦点）。窗口走 Wayland、剪贴板仍走 X11 的应用（比如 Wayland 模式的 Linux QQ）永远不会把焦点给 satellite，复制的内容两个方向都过不去；
 - X11 和 Wayland 的剪贴板格式（target/mime）并不一一对应，`x-special/gnome-copied-files`、`application/x-qt-image`、裸的 `UTF8_STRING` 这些 X 专有格式没有 Wayland 对应物，直接被丢掉；
 - X11 剪贴板是请求式的：复制的那个应用当 owner，别人粘贴得现场找它要数据。有些应用（某些 GTK/Qt 程序、复制完就退出的程序）这时候给不出来；
 - satellite 对 owner 的跟踪有时会失效，X11 应用就一直粘到旧内容。
 
-实际用起来连纯文本都看运气，微信/QQ（`QT_QPA_PLATFORM=xcb`）里复制图片、富文本、文件更是基本必挂。这是 satellite 生态的已知问题（[xwayland-satellite#50](https://github.com/Supreeeme/xwayland-satellite/issues/50)）。
+实际用起来，X11 模式的微信、QQ 连纯文本都看运气，复制图片、富文本、文件更是基本必挂（Wayland → X11 方向见 [xwayland-satellite#50](https://github.com/Supreeeme/xwayland-satellite/issues/50)）。
 
 ## 原理
 
@@ -24,6 +23,8 @@
 | ------------- | -------------------------------- | ---------- | ---------------------------- |
 | X11 → Wayland | `clipnotify`（循环重启）         | `xclip`    | `wl-copy`                    |
 | Wayland → X11 | `wl-paste --watch`（任意 offer） | `wl-paste` | `xclip`（接管 CLIPBOARD）    |
+
+两个方向都不依赖键盘焦点：`clipnotify` 通过 XFixes 监听 X11 剪贴板，`wl-clipboard` 通过合成器的 data-control 协议读写 Wayland 剪贴板。
 
 watcher 是主要触发源，每次变化都会触发。每侧另有一个很慢的兜底轮询（默认 60 秒），只用来兜住 watcher 偶尔漏掉的事件（watcher 卡死、重启空隙、push 失败），所以空闲时不会每几秒就把整个剪贴板读一遍。
 
