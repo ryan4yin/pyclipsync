@@ -11,7 +11,7 @@ python3Packages.buildPythonApplication {
   src = ../.;
 
   # single script, no third-party python deps
-  format = "other";
+  pyproject = false;
   doCheck = true;
 
   # The unit tests need no graphical session; the integration class in
@@ -28,15 +28,16 @@ python3Packages.buildPythonApplication {
   '';
 
   # The daemon shells out to wl-copy/wl-paste (wl-clipboard), xclip and
-  # clipnotify at runtime. Declaring them as propagatedBuildInputs lets the
-  # python wrap hook add their bin/ to the wrapper PATH automatically (and
-  # propagates them to consumers, e.g. a systemd service). The python
-  # interpreter itself (absolute shebang + PATH) is handled by
-  # buildPythonApplication.
-  propagatedBuildInputs = [
-    wl-clipboard
-    xclip
-    clipnotify
+  # clipnotify at runtime; the Python wrapper puts them on its PATH.
+  makeWrapperArgs = [
+    "--prefix"
+    "PATH"
+    ":"
+    (lib.makeBinPath [
+      wl-clipboard
+      xclip
+      clipnotify
+    ])
   ];
 
   meta = with lib; {
